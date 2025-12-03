@@ -10,7 +10,7 @@ from azure.storage.blob import BlobServiceClient
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "LDOUSDT", "LINKUSDT"]
 BASE_URL = "https://fapi.binance.com"
 RETRY_AFTER = 51
-SAVE_TO_CLOUD = False  # True = to Azure, False =  JSON in browser
+SAVE_TO_CLOUD = True  # True = to Azure, False =  JSON in browser
 
 # Candles
 def get_klines(symbol: str, interval: str = "15m", limit: int = 20) -> dict:

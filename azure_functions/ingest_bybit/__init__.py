@@ -10,7 +10,7 @@ from azure.storage.blob import BlobServiceClient
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "LDOUSDT", "LINKUSDT"]
 BASE_URL = "https://api.bybit.com"
 RETRY_AFTER = 60
-SAVE_TO_CLOUD = False  # True = to Azure, False = local
+SAVE_TO_CLOUD = True  # True = to Azure, False = local
 
 # Candles
 def get_klines(symbol: str, interval: str = "15", limit: int = 20) -> dict:
