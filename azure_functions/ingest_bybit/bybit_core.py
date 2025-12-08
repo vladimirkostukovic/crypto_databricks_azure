@@ -170,7 +170,7 @@ def get_open_interest(symbol: str, interval: str = "15min", limit: int = 10) -> 
 
 # Validate fetched data for completeness
 def validate_data(data: Dict, symbol: str) -> bool:
-    required_fields = ["symbol", "timestamp", "intervals_included", "klines", "ticker"]
+    required_fields = ["symbol", "timestamp", "interval", "klines", "ticker"]
 
     for field in required_fields:
         if field not in data:
@@ -184,27 +184,21 @@ def validate_data(data: Dict, symbol: str) -> bool:
     return True
 
 
-# Fetch data for one symbol with specified intervals
-def fetch_symbol_data(symbol: str, intervals_to_fetch: List[str]) -> Optional[Dict]:
+# Fetch data for one symbol for ONE interval
+def fetch_symbol_data(symbol: str, interval: str) -> Optional[Dict]:
     try:
         now = datetime.utcnow()
+        bybit_interval = BYBIT_INTERVALS[interval]
 
-        if not intervals_to_fetch:
-            logging.debug(f"⊘ {symbol} - no intervals specified")
-            return None
-
-        # Fetch klines for specified intervals
-        klines_data = {}
-        for interval in intervals_to_fetch:
-            bybit_interval = BYBIT_INTERVALS[interval]
-            klines_data[interval] = get_klines(symbol, bybit_interval)
-            logging.debug(f"  Fetched {interval} for {symbol}")
+        # Fetch klines for this interval
+        klines_data = get_klines(symbol, bybit_interval)
+        logging.debug(f"  Fetched {interval} for {symbol}")
 
         # Fetch market data
         data = {
             "symbol": symbol,
             "timestamp": now.isoformat(),
-            "intervals_included": intervals_to_fetch,
+            "interval": interval,
             "klines": klines_data,
             "ticker": get_tickers(symbol),
             "orderbook": get_orderbook(symbol, 20),
@@ -216,29 +210,31 @@ def fetch_symbol_data(symbol: str, intervals_to_fetch: List[str]) -> Optional[Di
         if not validate_data(data, symbol):
             raise ValueError(f"Data validation failed for {symbol}")
 
-        logging.info(f"✓ {symbol} - {len(intervals_to_fetch)} intervals")
+        logging.info(f"✓ {symbol} - {interval}")
         time.sleep(0.2)  # Rate limit protection
         return data
 
     except Exception as e:
-        logging.error(f"✗ {symbol}: {e}", exc_info=True)
+        logging.error(f"✗ {symbol} [{interval}]: {e}", exc_info=True)
         return {
             "symbol": symbol,
             "timestamp": datetime.utcnow().isoformat(),
+            "interval": interval,
             "error": str(e),
             "error_type": type(e).__name__
         }
 
 
-def save_combined_data(data: Dict) -> Optional[str]:
+# Save data for ONE interval to separate file
+def save_interval_data(data: Dict, interval: str) -> Optional[str]:
     if not SAVE_TO_CLOUD:
-        return save_combined_local(data)
+        return save_interval_local(data, interval)
 
     cs = os.environ.get("STORAGE_CONNECTION_STRING")
 
     if not cs:
         logging.error("STORAGE_CONNECTION_STRING not set, saving locally")
-        return save_combined_local(data)
+        return save_interval_local(data, interval)
 
     try:
         svc = BlobServiceClient.from_connection_string(cs)
@@ -249,7 +245,8 @@ def save_combined_data(data: Dict) -> Optional[str]:
         hour_str = now.strftime("%H")
         timestamp_str = now.strftime("%Y%m%d_%H%M%S")
 
-        blob_path = f"bybit/date={date_str}/hour={hour_str}/{timestamp_str}.json"
+        # bybit/date=2025-12-08/hour=14/20251208_140315_15m.json
+        blob_path = f"bybit/date={date_str}/hour={hour_str}/{timestamp_str}_{interval}.json"
         blob_client = container.get_blob_client(blob_path)
 
         for attempt in range(MAX_RETRIES):
@@ -270,15 +267,15 @@ def save_combined_data(data: Dict) -> Optional[str]:
 
     except Exception as e:
         logging.error(f"Storage failed: {e}")
-        return save_combined_local(data)
+        return save_interval_local(data, interval)
 
 
-# Fallback: save combined data locally
-def save_combined_local(data: Dict) -> str:
+# Fallback: save interval data locally
+def save_interval_local(data: Dict, interval: str) -> str:
     now = datetime.utcnow()
     local_dir = "/tmp/bybit"
     os.makedirs(local_dir, exist_ok=True)
-    local_path = f"{local_dir}/{now.strftime('%Y%m%d_%H%M%S')}.json"
+    local_path = f"{local_dir}/{now.strftime('%Y%m%d_%H%M%S')}_{interval}.json"
 
     with open(local_path, 'w') as f:
         json.dump(data, f, indent=2)
@@ -299,54 +296,70 @@ def run(intervals: List[str] = None) -> Dict:
     start_time = time.time()
 
     try:
-        all_symbols_data = []
-        success_count = 0
-        failed_count = 0
-        errors = []
+        results_by_interval = {}
+        total_success = 0
+        total_failed = 0
+        all_errors = []
 
-        for symbol in SYMBOLS:
-            logging.info(f"Processing {symbol}...")
-            symbol_data = fetch_symbol_data(symbol, intervals)
+        # Process each interval separately
+        for interval in intervals:
+            interval_symbols_data = []
+            success_count = 0
+            failed_count = 0
 
-            if symbol_data is None:
-                continue
+            for symbol in SYMBOLS:
+                logging.info(f"Processing {symbol} [{interval}]...")
+                symbol_data = fetch_symbol_data(symbol, interval)
 
-            if "error" not in symbol_data:
-                all_symbols_data.append(symbol_data)
-                success_count += 1
-            else:
-                failed_count += 1
-                errors.append({
-                    "symbol": symbol,
-                    "error": symbol_data.get("error"),
-                    "error_type": symbol_data.get("error_type")
-                })
+                if symbol_data is None:
+                    continue
 
-        # Create one combined file with all symbols
-        combined_data = {
-            "timestamp": now.isoformat(),
-            "intervals": intervals,
-            "symbols": all_symbols_data
-        }
+                if "error" not in symbol_data:
+                    interval_symbols_data.append(symbol_data)
+                    success_count += 1
+                else:
+                    failed_count += 1
+                    all_errors.append({
+                        "symbol": symbol,
+                        "interval": interval,
+                        "error": symbol_data.get("error"),
+                        "error_type": symbol_data.get("error_type")
+                    })
 
-        # Save single file
-        saved_path = save_combined_data(combined_data)
+            # Create separate file for this interval
+            interval_data = {
+                "timestamp": now.isoformat(),
+                "interval": interval,
+                "symbols": interval_symbols_data
+            }
+
+            # Save to separate file
+            saved_path = save_interval_data(interval_data, interval)
+
+            results_by_interval[interval] = {
+                "symbols_processed": success_count,
+                "symbols_failed": failed_count,
+                "file_saved": saved_path
+            }
+
+            total_success += success_count
+            total_failed += failed_count
 
         duration = time.time() - start_time
         logging.info(f"Completed in {duration:.2f}s")
 
         result = {
-            "status": "success" if failed_count == 0 else "partial_success",
+            "status": "success" if total_failed == 0 else "partial_success",
             "intervals_fetched": intervals,
-            "symbols_processed": success_count,
-            "symbols_failed": failed_count,
-            "file_saved": saved_path,
+            "total_symbols_processed": total_success,
+            "total_symbols_failed": total_failed,
+            "results_by_interval": results_by_interval,
             "duration_seconds": round(duration, 2),
             "timestamp": now.isoformat()
         }
 
-        if errors:
-            result["errors"] = errors
+        if all_errors:
+            result["errors"] = all_errors
 
         return result
 
