@@ -16,7 +16,7 @@ MAX_RETRIES = 3
 REQUEST_TIMEOUT = 10
 SAVE_TO_CLOUD = True
 
-# Interval limits configuration (Bybit uses different naming)
+# Interval limits configuration (for funding_rate and open_interest)
 INTERVAL_LIMITS = {
     "15": 1000,  # 15 minutes
     "60": 1000,  # 1 hour
@@ -30,6 +30,14 @@ BYBIT_INTERVALS = {
     "1h": "60",
     "4h": "240",
     "1d": "D"
+}
+
+# Interval duration in minutes (for endTime calculation)
+INTERVAL_MINUTES = {
+    "15": 15,
+    "60": 60,
+    "240": 240,
+    "D": 1440
 }
 
 
@@ -96,21 +104,23 @@ def api_call(url: str, params: dict, retry_count: int = 0, max_retries: int = MA
         raise
 
 
-# Fetch klines with respect to limits per interval
-def get_klines(symbol: str, interval: str = "15", limit: int = None) -> Dict:
-    if limit is None:
-        limit = INTERVAL_LIMITS.get(interval, 200)
-    else:
-        max_limit = INTERVAL_LIMITS.get(interval, 1000)
-        limit = min(limit, max_limit)
-
+# Fetch last closed kline only
+def get_klines(symbol: str, interval: str = "15") -> Dict:
     url = f"{BASE_URL}/v5/market/kline"
+
+    # Calculate endTime to ensure closed candle only
+    now_ms = int(datetime.utcnow().timestamp() * 1000)
+    interval_ms = INTERVAL_MINUTES.get(interval, 15) * 60 * 1000
+    end_time = now_ms - interval_ms
+
     params = {
         "category": "linear",
         "symbol": symbol,
         "interval": interval,
-        "limit": limit
+        "limit": 1,  # Only last closed candle
+        "end": end_time
     }
+
     return api_call(url, params)
 
 
@@ -187,11 +197,7 @@ def fetch_symbol_data(symbol: str, intervals_to_fetch: List[str]) -> Optional[Di
         klines_data = {}
         for interval in intervals_to_fetch:
             bybit_interval = BYBIT_INTERVALS[interval]
-            klines_data[interval] = get_klines(
-                symbol,
-                bybit_interval,
-                INTERVAL_LIMITS[bybit_interval]
-            )
+            klines_data[interval] = get_klines(symbol, bybit_interval)
             logging.debug(f"  Fetched {interval} for {symbol}")
 
         # Fetch market data
@@ -224,7 +230,6 @@ def fetch_symbol_data(symbol: str, intervals_to_fetch: List[str]) -> Optional[Di
         }
 
 
-# Save combined data to single JSON file in Azure Storage
 def save_combined_data(data: Dict) -> Optional[str]:
     if not SAVE_TO_CLOUD:
         return save_combined_local(data)

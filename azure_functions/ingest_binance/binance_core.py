@@ -16,12 +16,20 @@ MAX_RETRIES = 3
 REQUEST_TIMEOUT = 10
 SAVE_TO_CLOUD = True
 
-# Interval limits configuration
+# Interval limits configuration (for funding_rate)
 INTERVAL_LIMITS = {
     "15m": 1500,
     "1h": 1000,
     "4h": 100,
     "1d": 100
+}
+
+# Interval duration in minutes (for endTime calculation)
+INTERVAL_MINUTES = {
+    "15m": 15,
+    "1h": 60,
+    "4h": 240,
+    "1d": 1440
 }
 
 
@@ -87,16 +95,22 @@ def api_call(url: str, params: dict, retry_count: int = 0, max_retries: int = MA
         raise
 
 
-# Fetch klines with respect to limits per interval
-def get_klines(symbol: str, interval: str = "15m", limit: int = None) -> List:
-    if limit is None:
-        limit = INTERVAL_LIMITS.get(interval, 100)
-    else:
-        max_limit = INTERVAL_LIMITS.get(interval, 1500)
-        limit = min(limit, max_limit)
-
+# Fetch last closed kline only
+def get_klines(symbol: str, interval: str = "15m") -> List:
     url = f"{BASE_URL}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+
+    # Calculate endTime to ensure closed candle only
+    now_ms = int(datetime.utcnow().timestamp() * 1000)
+    interval_ms = INTERVAL_MINUTES.get(interval, 15) * 60 * 1000
+    end_time = now_ms - interval_ms
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": 1,  # Only last closed candle
+        "endTime": end_time
+    }
+
     return api_call(url, params)
 
 
@@ -152,7 +166,7 @@ def fetch_symbol_data(symbol: str, intervals_to_fetch: List[str]) -> Optional[Di
         # Fetch klines for specified intervals
         klines_data = {}
         for interval in intervals_to_fetch:
-            klines_data[interval] = get_klines(symbol, interval, INTERVAL_LIMITS[interval])
+            klines_data[interval] = get_klines(symbol, interval)
             logging.debug(f"  Fetched {interval} for {symbol}")
 
         # Fetch market data
