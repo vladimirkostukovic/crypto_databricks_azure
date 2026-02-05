@@ -6,23 +6,31 @@ import time
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from azure.storage.blob import BlobServiceClient, ContainerClient
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "LDOUSDT", "LINKUSDT"]
-BASE_URL = "https://fapi.binance.com"
+SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "LDO-USDT-SWAP", "LINK-USDT-SWAP"]
+BASE_URL = "https://www.okx.com"
 CONTAINER_NAME = "landing-dev"
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 10
 SAVE_TO_CLOUD = True
 MAX_VALIDATION_RETRIES = 2
 
+INTERVAL_TO_BAR = {
+    "15m": "15m",
+    "1h": "1H",
+    "4h": "4H",
+    "1d": "1D"
+}
+
 INTERVAL_LIMITS = {
-    "15m": 1500,
-    "1h": 1000,
-    "4h": 100,
-    "1d": 100
+    "15m": 300,
+    "1h": 300,
+    "4h": 300,
+    "1d": 300
 }
 
 INTERVAL_MINUTES = {
@@ -36,22 +44,22 @@ INTERVAL_CHECK_CONFIG = {
     "15m": {
         "daily_depth": 10,
         "weekly_depth": 672,
-        "full_history": 1000
+        "full_history": 300
     },
     "1h": {
         "daily_depth": 10,
         "weekly_depth": 168,
-        "full_history": 1000
+        "full_history": 300
     },
     "4h": {
         "daily_depth": 6,
         "weekly_depth": 42,
-        "full_history": 500
+        "full_history": 300
     },
     "1d": {
         "daily_depth": 3,
         "weekly_depth": 30,
-        "full_history": 365
+        "full_history": 300
     }
 }
 
@@ -84,12 +92,6 @@ def api_call(url: str, params: dict, retry_count: int = 0, max_retries: int = MA
     try:
         r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
 
-        if 'X-MBX-USED-WEIGHT-1M' in r.headers:
-            weight = int(r.headers['X-MBX-USED-WEIGHT-1M'])
-            if weight > 1000:
-                logging.warning(f"Rate limit close: {weight}/1200")
-                time.sleep(2)
-
         if r.status_code == 429:
             retry_after = int(r.headers.get('Retry-After', 60))
             logging.warning(f"Rate limited, waiting {retry_after}s")
@@ -98,12 +100,22 @@ def api_call(url: str, params: dict, retry_count: int = 0, max_retries: int = MA
                 return api_call(url, params, retry_count + 1, max_retries)
             raise Exception("Max retries exceeded on 429")
 
-        if r.status_code == 418:
-            logging.error("IP banned by Binance")
-            raise Exception("IP banned - please check your IP whitelist")
-
         r.raise_for_status()
-        return r.json()
+        response = r.json()
+
+        if isinstance(response, dict):
+            code = response.get("code")
+            if code != "0":
+                msg = response.get("msg", "Unknown error")
+                if code == "50011":
+                    logging.warning(f"OKX rate limit reached, waiting 2s")
+                    time.sleep(2)
+                    if retry_count < max_retries:
+                        return api_call(url, params, retry_count + 1, max_retries)
+                raise Exception(f"OKX API error code={code}: {msg}")
+            return response.get("data", [])
+
+        return response
 
     except requests.exceptions.Timeout:
         logging.warning(f"Timeout, retry {retry_count + 1}/{max_retries}")
@@ -120,63 +132,160 @@ def api_call(url: str, params: dict, retry_count: int = 0, max_retries: int = MA
         raise
 
 
-def get_klines(symbol: str, interval: str = "15m", limit: int = 1) -> List:
-    url = f"{BASE_URL}/fapi/v1/klines"
+def get_klines(symbol: str, interval: str = "15m", limit: int = 1, include_current: bool = False) -> List:
+    url = f"{BASE_URL}/api/v5/market/candles"
+    bar = INTERVAL_TO_BAR.get(interval, "15m")
 
-    now_ms = int(datetime.utcnow().timestamp() * 1000)
-    interval_ms = INTERVAL_MINUTES.get(interval, 15) * 60 * 1000
-    end_time = now_ms - interval_ms
+    request_limit = min(limit + 2, 300)
 
     params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
-        "endTime": end_time
+        "instId": symbol,
+        "bar": bar,
+        "limit": str(request_limit)
     }
 
-    return api_call(url, params)
+    data = api_call(url, params)
+
+    if not data:
+        return []
+
+    if include_current:
+        candles = [c for c in data if isinstance(c, list) and len(c) >= 9]
+    else:
+        # only confirmed candles
+        candles = [c for c in data if isinstance(c, list) and len(c) >= 9 and c[8] == "1"]
+
+    if limit and len(candles) > limit:
+        candles = candles[:limit]
+
+    return candles
 
 
-def get_ticker_price(symbol: str) -> Dict:
-    url = f"{BASE_URL}/fapi/v1/ticker/price"
-    return api_call(url, {"symbol": symbol})
+def get_history_klines(symbol: str, interval: str = "15m", limit: int = 100) -> List:
+    url = f"{BASE_URL}/api/v5/market/history-candles"
+    bar = INTERVAL_TO_BAR.get(interval, "15m")
+
+    all_candles = []
+    after = None
+    remaining = limit
+
+    while remaining > 0:
+        batch_limit = min(remaining, 100)
+
+        params = {
+            "instId": symbol,
+            "bar": bar,
+            "limit": str(batch_limit)
+        }
+        if after:
+            params["after"] = str(after)
+
+        data = api_call(url, params)
+
+        if not data or len(data) == 0:
+            break
+
+        closed = [c for c in data if isinstance(c, list) and len(c) >= 9 and c[8] == "1"]
+        all_candles.extend(closed)
+        remaining -= len(closed)
+
+        last_ts = data[-1][0] if data else None
+        if last_ts:
+            after = last_ts
+        else:
+            break
+
+        time.sleep(0.2)
+
+    return all_candles
 
 
-def get_depth(symbol: str, limit: int = 20) -> Dict:
-    url = f"{BASE_URL}/fapi/v1/depth"
-    return api_call(url, {"symbol": symbol, "limit": min(limit, 1000)})
+def get_ticker(symbol: str) -> Optional[Dict]:
+    url = f"{BASE_URL}/api/v5/market/ticker"
+    data = api_call(url, {"instId": symbol})
+    if data and isinstance(data, list) and len(data) > 0:
+        return data[0]
+    return None
 
 
-def get_funding_rate(symbol: str, limit: int = 10) -> List:
-    url = f"{BASE_URL}/fapi/v1/fundingRate"
-    return api_call(url, {"symbol": symbol, "limit": min(limit, 1000)})
+def get_depth(symbol: str, limit: int = 20) -> Optional[Dict]:
+    url = f"{BASE_URL}/api/v5/market/books"
+    data = api_call(url, {"instId": symbol, "sz": str(min(limit, 400))})
+    if data and isinstance(data, list) and len(data) > 0:
+        return data[0]
+    return None
 
 
-def get_open_interest(symbol: str) -> Dict:
-    url = f"{BASE_URL}/fapi/v1/openInterest"
-    return api_call(url, {"symbol": symbol})
+def get_funding_rate(symbol: str) -> Optional[Dict]:
+    url = f"{BASE_URL}/api/v5/public/funding-rate"
+    data = api_call(url, {"instId": symbol})
+    if data and isinstance(data, list) and len(data) > 0:
+        return data[0]
+    return None
 
 
-def get_long_short_ratio(symbol: str, period: str = "15m", limit: int = 10) -> List:
-    url = f"{BASE_URL}/futures/data/globalLongShortAccountRatio"
-    return api_call(url, {"symbol": symbol, "period": period, "limit": min(limit, 500)})
+def get_funding_rate_history(symbol: str, limit: int = 10) -> List:
+    url = f"{BASE_URL}/api/v5/public/funding-rate-history"
+    data = api_call(url, {"instId": symbol, "limit": str(min(limit, 100))})
+    return data if data else []
 
 
-def get_top_long_short_accounts(symbol: str, period: str = "15m", limit: int = 10) -> List:
-    url = f"{BASE_URL}/futures/data/topLongShortAccountRatio"
-    return api_call(url, {"symbol": symbol, "period": period, "limit": min(limit, 500)})
+def get_open_interest(symbol: str) -> Optional[Dict]:
+    url = f"{BASE_URL}/api/v5/public/open-interest"
+    data = api_call(url, {"instType": "SWAP", "instId": symbol})
+    if data and isinstance(data, list) and len(data) > 0:
+        return data[0]
+    return None
 
 
-def get_top_long_short_positions(symbol: str, period: str = "15m", limit: int = 10) -> List:
-    url = f"{BASE_URL}/futures/data/topLongShortPositionRatio"
-    return api_call(url, {"symbol": symbol, "period": period, "limit": min(limit, 500)})
+def get_long_short_ratio(symbol: str, period: str = "15m") -> List:
+    # OKX uses underlying asset (BTC, ETH) not full instId
+    ccy = symbol.split("-")[0]
+    url = f"{BASE_URL}/api/v5/rubik/stat/contracts/long-short-account-ratio"
+    return api_call(url, {"ccy": ccy, "period": period}) or []
 
 
-def get_taker_buy_sell_ratio(symbol: str, period: str = "15m", limit: int = 10) -> List:
-    url = f"{BASE_URL}/futures/data/takerlongshortRatio"
-    return api_call(url, {"symbol": symbol, "period": period, "limit": min(limit, 500)})
+def get_taker_volume(symbol: str, period: str = "5m") -> List:
+    # taker buy/sell volume - use CONTRACTS instType
+    ccy = symbol.split("-")[0]
+    url = f"{BASE_URL}/api/v5/rubik/stat/taker-volume"
+    try:
+        return api_call(url, {"ccy": ccy, "instType": "CONTRACTS", "period": period}) or []
+    except Exception:
+        return []
 
 
+
+
+def get_realtime_kline(symbol: str, interval: str = "15m") -> Optional[Dict]:
+    url = f"{BASE_URL}/api/v5/market/candles"
+    bar = INTERVAL_TO_BAR.get(interval, "15m")
+
+    params = {
+        "instId": symbol,
+        "bar": bar,
+        "limit": "1"
+    }
+
+    data = api_call(url, params)
+
+    if not data or not isinstance(data, list) or len(data) == 0:
+        return None
+
+    candle = data[0]
+    if isinstance(candle, list) and len(candle) >= 9:
+        return {
+            "timestamp": int(candle[0]),
+            "open": float(candle[1]),
+            "high": float(candle[2]),
+            "low": float(candle[3]),
+            "close": float(candle[4]),
+            "volume": float(candle[5]),
+            "volume_ccy": float(candle[6]),
+            "volume_quote": float(candle[7]),
+            "is_closed": candle[8] == "1"
+        }
+    return None
 
 
 def validate_data(data: Dict, symbol: str) -> bool:
@@ -202,22 +311,25 @@ def fetch_symbol_data(symbol: str, interval: str, retry_attempt: int = 0) -> Opt
     try:
         now = datetime.utcnow()
 
-        klines_data = get_klines(symbol, interval, limit=1)
-        logging.debug(f"  Fetched {interval} for {symbol}")
+        klines_data = get_klines(symbol, interval, limit=2)
+        logging.debug(f"  Fetched {interval} for {symbol}: {len(klines_data)} candles")
+
+        # map interval to OKX period format
+        period_map = {"15m": "5m", "1h": "1H", "4h": "4H", "1d": "1D"}
+        period = period_map.get(interval, "5m")
 
         data = {
             "symbol": symbol,
             "timestamp": now.isoformat(),
             "interval": interval,
             "klines": klines_data,
-            "ticker": get_ticker_price(symbol),
+            "ticker": get_ticker(symbol),
             "depth": get_depth(symbol, 20),
-            "funding_rate": get_funding_rate(symbol, 10),
+            "funding_rate": get_funding_rate(symbol),
+            "funding_rate_history": get_funding_rate_history(symbol, 10),
             "open_interest": get_open_interest(symbol),
-            "long_short_ratio": get_long_short_ratio(symbol, interval, 10),
-            "top_long_short_accounts": get_top_long_short_accounts(symbol, interval, 10),
-            "top_long_short_positions": get_top_long_short_positions(symbol, interval, 10),
-            "taker_buy_sell_ratio": get_taker_buy_sell_ratio(symbol, interval, 10)
+            "long_short_ratio": get_long_short_ratio(symbol, period),
+            "taker_volume": get_taker_volume(symbol, period)
         }
 
         if not validate_data(data, symbol):
@@ -264,7 +376,7 @@ def append_to_logs(result: Dict, interval: str):
 
         log_entry = {
             "timestamp": datetime.utcnow().isoformat(),
-            "exchange": "binance",
+            "exchange": "okx",
             "interval": interval,
             "status": result.get("status"),
             "symbols_processed": result.get("symbols_processed", 0),
@@ -307,7 +419,7 @@ def save_interval_data(data: Dict, interval: str) -> Optional[str]:
         hour_str = now.strftime("%H")
         timestamp_str = now.strftime("%Y%m%d_%H%M%S")
 
-        blob_path = f"binance/date={date_str}/hour={hour_str}/{timestamp_str}_{interval}.json"
+        blob_path = f"okx/date={date_str}/hour={hour_str}/{timestamp_str}_{interval}.json"
         blob_client = container.get_blob_client(blob_path)
 
         for attempt in range(MAX_RETRIES):
@@ -333,7 +445,7 @@ def save_interval_data(data: Dict, interval: str) -> Optional[str]:
 
 def save_interval_local(data: Dict, interval: str) -> str:
     now = datetime.utcnow()
-    local_dir = "/tmp/binance"
+    local_dir = "/tmp/okx"
     os.makedirs(local_dir, exist_ok=True)
     local_path = f"{local_dir}/{now.strftime('%Y%m%d_%H%M%S')}_{interval}.json"
 
@@ -359,7 +471,7 @@ def get_container_client() -> Optional[ContainerClient]:
 
 
 def backfill_missing_candles() -> Dict:
-    logging.info("Starting backfill check...")
+    logging.info("Starting OKX backfill check...")
     container = get_container_client()
 
     if not container:
@@ -376,7 +488,7 @@ def backfill_missing_candles() -> Dict:
         symbol_candle_counts = {}
 
         try:
-            blobs = list(container.list_blobs(name_starts_with="binance/"))
+            blobs = list(container.list_blobs(name_starts_with="okx/"))
             interval_blobs = [b for b in blobs if f"_{interval}.json" in b.name]
 
             for blob in interval_blobs:
@@ -413,13 +525,14 @@ def backfill_missing_candles() -> Dict:
                         f"[{interval}] {symbol}: {current_count}/{required_depth} candles, backfilling {missing_count}...")
 
                     try:
-                        backfill_limit = min(missing_count, INTERVAL_LIMITS.get(interval, 1000))
-                        backfill_data = get_klines(symbol, interval, limit=backfill_limit)
+                        backfill_limit = min(missing_count, INTERVAL_LIMITS.get(interval, 300))
+                        backfill_data = get_history_klines(symbol, interval, limit=backfill_limit)
 
                         if backfill_data and isinstance(backfill_data, list) and len(backfill_data) > 0:
                             now = datetime.utcnow()
                             backfill_json = {
                                 "timestamp": now.isoformat(),
+                                "exchange": "okx",
                                 "interval": interval,
                                 "backfill": True,
                                 "symbols": [{
@@ -427,9 +540,10 @@ def backfill_missing_candles() -> Dict:
                                     "timestamp": now.isoformat(),
                                     "interval": interval,
                                     "klines": backfill_data,
-                                    "ticker": get_ticker_price(symbol),
+                                    "ticker": get_ticker(symbol),
                                     "depth": get_depth(symbol, 20),
-                                    "funding_rate": get_funding_rate(symbol, 10),
+                                    "funding_rate": get_funding_rate(symbol),
+                                    "funding_rate_history": get_funding_rate_history(symbol, 10),
                                     "open_interest": get_open_interest(symbol)
                                 }],
                                 "total_symbols": 1,
@@ -440,7 +554,7 @@ def backfill_missing_candles() -> Dict:
                             date_str = now.strftime("%Y-%m-%d")
                             hour_str = now.strftime("%H")
                             timestamp_str = now.strftime("%Y%m%d_%H%M%S")
-                            blob_path = f"binance/date={date_str}/hour={hour_str}/{timestamp_str}_{interval}_backfill_{symbol}.json"
+                            blob_path = f"okx/date={date_str}/hour={hour_str}/{timestamp_str}_{interval}_backfill_{symbol.replace('-', '_')}.json"
 
                             blob_client = container.get_blob_client(blob_path)
                             blob_client.upload_blob(
@@ -485,7 +599,7 @@ def backfill_missing_candles() -> Dict:
 
 
 def daily_health_check() -> Dict:
-    logging.info("Starting daily health check...")
+    logging.info("Starting OKX daily health check...")
     container = get_container_client()
 
     if not container:
@@ -498,7 +612,7 @@ def daily_health_check() -> Dict:
         depth = config["daily_depth"]
         logging.info(f"Checking last {depth} files for {interval}...")
 
-        blobs = list(container.list_blobs(name_starts_with=f"binance/"))
+        blobs = list(container.list_blobs(name_starts_with="okx/"))
         interval_blobs = [b for b in blobs if f"_{interval}.json" in b.name]
         interval_blobs.sort(key=lambda x: x.name, reverse=True)
 
@@ -538,7 +652,7 @@ def daily_health_check() -> Dict:
 
 
 def weekly_full_audit() -> Dict:
-    logging.info("Starting weekly full audit...")
+    logging.info("Starting OKX weekly full audit...")
     container = get_container_client()
 
     if not container:
@@ -551,7 +665,7 @@ def weekly_full_audit() -> Dict:
         depth = config["weekly_depth"]
         logging.info(f"Auditing {depth} files for {interval}...")
 
-        blobs = list(container.list_blobs(name_starts_with=f"binance/"))
+        blobs = list(container.list_blobs(name_starts_with="okx/"))
         interval_blobs = [b for b in blobs if f"_{interval}.json" in b.name]
         interval_blobs.sort(key=lambda x: x.name, reverse=True)
 
@@ -591,7 +705,7 @@ def weekly_full_audit() -> Dict:
 
 
 def cleanup_old_files() -> Dict:
-    logging.info("Starting cleanup of old files...")
+    logging.info("Starting cleanup of old OKX files...")
     container = get_container_client()
 
     if not container:
@@ -609,7 +723,7 @@ def cleanup_old_files() -> Dict:
         deleted_count = 0
 
         try:
-            blobs = container.list_blobs(name_starts_with="binance/")
+            blobs = container.list_blobs(name_starts_with="okx/")
 
             for blob in blobs:
                 if f"_{interval}.json" not in blob.name:
@@ -645,14 +759,23 @@ def cleanup_old_files() -> Dict:
     }
 
 
-def run(intervals: List[str] = None) -> Dict:
+def _fetch_symbol_parallel(symbol: str, interval: str) -> Dict:
+    try:
+        result = fetch_symbol_data(symbol, interval)
+        return {"symbol": symbol, "data": result, "success": result is not None and "error" not in result}
+    except Exception as e:
+        logging.error(f"Parallel fetch failed for {symbol}: {e}")
+        return {"symbol": symbol, "data": None, "success": False, "error": str(e)}
+
+
+def run(intervals: List[str] = None, parallel: bool = True, max_workers: int = 4) -> Dict:
     now = datetime.utcnow()
-    logging.info(f"Starting Binance ingestion at {now.strftime('%Y-%m-%d %H:%M')} UTC")
+    logging.info(f"Starting OKX ingestion at {now.strftime('%Y-%m-%d %H:%M')} UTC")
 
     if not intervals:
         intervals = ["15m"]
 
-    logging.info(f"Fetching intervals: {', '.join(intervals)}")
+    logging.info(f"Fetching intervals: {', '.join(intervals)} (parallel={parallel})")
     start_time = time.time()
 
     try:
@@ -679,25 +802,54 @@ def run(intervals: List[str] = None) -> Dict:
 
                 failed_symbols = []
 
-                for symbol in symbols_to_fetch:
-                    logging.info(f"Processing {symbol} [{interval}]...")
-                    symbol_data = fetch_symbol_data(symbol, interval)
+                if parallel and len(symbols_to_fetch) > 1:
+                    with ThreadPoolExecutor(max_workers=min(max_workers, len(symbols_to_fetch))) as executor:
+                        futures = {
+                            executor.submit(_fetch_symbol_parallel, symbol, interval): symbol
+                            for symbol in symbols_to_fetch
+                        }
 
-                    if symbol_data is None:
-                        continue
+                        for future in as_completed(futures):
+                            symbol = futures[future]
+                            try:
+                                result = future.result()
+                                if result["success"]:
+                                    interval_symbols_data.append(result["data"])
+                                    success_symbols.add(symbol)
+                                    logging.info(f"✓ {symbol} [{interval}]")
+                                else:
+                                    failed_symbols.append(symbol)
+                                    error_info = result.get("data", {})
+                                    all_errors.append({
+                                        "symbol": symbol,
+                                        "interval": interval,
+                                        "attempt": attempt + 1,
+                                        "error": error_info.get("error") if isinstance(error_info, dict) else str(result.get("error")),
+                                        "error_type": error_info.get("error_type") if isinstance(error_info, dict) else "Unknown"
+                                    })
+                            except Exception as e:
+                                failed_symbols.append(symbol)
+                                logging.error(f"Future failed for {symbol}: {e}")
+                else:
+                    for symbol in symbols_to_fetch:
+                        logging.info(f"Processing {symbol} [{interval}]...")
+                        symbol_data = fetch_symbol_data(symbol, interval)
 
-                    if "error" not in symbol_data:
-                        interval_symbols_data.append(symbol_data)
-                        success_symbols.add(symbol)
-                    else:
-                        failed_symbols.append(symbol)
-                        all_errors.append({
-                            "symbol": symbol,
-                            "interval": interval,
-                            "attempt": attempt + 1,
-                            "error": symbol_data.get("error"),
-                            "error_type": symbol_data.get("error_type")
-                        })
+                        if symbol_data is None:
+                            continue
+
+                        if "error" not in symbol_data:
+                            interval_symbols_data.append(symbol_data)
+                            success_symbols.add(symbol)
+                        else:
+                            failed_symbols.append(symbol)
+                            all_errors.append({
+                                "symbol": symbol,
+                                "interval": interval,
+                                "attempt": attempt + 1,
+                                "error": symbol_data.get("error"),
+                                "error_type": symbol_data.get("error_type")
+                            })
 
                 if len(success_symbols) == len(SYMBOLS):
                     logging.info(f"✓ [{interval}] All {len(SYMBOLS)} symbols fetched successfully")
@@ -718,6 +870,7 @@ def run(intervals: List[str] = None) -> Dict:
 
             interval_data = {
                 "timestamp": now.isoformat(),
+                "exchange": "okx",
                 "interval": interval,
                 "symbols": interval_symbols_data,
                 "total_symbols": len(SYMBOLS),
@@ -754,6 +907,7 @@ def run(intervals: List[str] = None) -> Dict:
 
         result = {
             "status": "success" if total_failed == 0 else "partial_success",
+            "exchange": "okx",
             "intervals_fetched": intervals,
             "total_symbols_processed": total_success,
             "total_symbols_failed": total_failed,
@@ -771,6 +925,7 @@ def run(intervals: List[str] = None) -> Dict:
         logging.error(f"Run failed: {e}", exc_info=True)
         return {
             "status": "failed",
+            "exchange": "okx",
             "error": str(e),
             "error_type": type(e).__name__,
             "timestamp": now.isoformat()
@@ -779,7 +934,7 @@ def run(intervals: List[str] = None) -> Dict:
 
 def health_check() -> Dict:
     try:
-        api_call(f"{BASE_URL}/fapi/v1/ping", {})
+        data = api_call(f"{BASE_URL}/api/v5/public/time", {})
 
         storage_connection_string = os.environ.get("STORAGE_CONNECTION_STRING")
         if storage_connection_string:
@@ -788,13 +943,16 @@ def health_check() -> Dict:
 
         return {
             "status": "healthy",
-            "binance_api": "ok",
+            "exchange": "okx",
+            "okx_api": "ok",
+            "okx_server_time": data[0].get("ts") if data else None,
             "storage": "ok" if storage_connection_string else "not_configured",
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
         return {
             "status": "unhealthy",
+            "exchange": "okx",
             "error": str(e),
             "timestamp": datetime.utcnow().isoformat()
         }
