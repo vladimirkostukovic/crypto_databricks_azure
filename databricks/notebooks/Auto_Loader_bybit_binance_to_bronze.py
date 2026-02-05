@@ -65,8 +65,9 @@ def autoload_interval(exchange: str, interval: str):
             spark.readStream
             .format("cloudFiles")
             .option("cloudFiles.format", "json")
-            .option("cloudFiles.schemaLocation", f"{BRONZE_PATH}{exchange}/_schema")
+            .option("cloudFiles.schemaLocation", f"{BRONZE_PATH}{exchange}/_schema_{interval}")
             .option("cloudFiles.inferColumnTypes", "true")
+            .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
             .option("cloudFiles.rescuedDataColumn", "_rescued_data")
             .option("recursiveFileLookup", "true")
             .option("multiLine", "true")
