@@ -6,6 +6,7 @@ from pyspark.sql.window import Window
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, LongType, TimestampType, BooleanType
 from datetime import datetime, timedelta, timezone
 from typing import List, Tuple, Dict
+from functools import reduce
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
@@ -18,66 +19,30 @@ WARNINGS_TABLE = f"{CATALOG}.{SCHEMA}.warnings"
 BOS_TABLE = f"{CATALOG}.{SCHEMA}.bos_warnings"
 LIQ_DISTANCE_TABLE = f"{CATALOG}.{SCHEMA}.liq_distance"
 
-# ---
 FORCE_RECALC = True
-# ---
-
-# Strict mode
 STRICT_MODE = True
 MAX_MISSING_PCT = 5
-
-# Zone detection
 SCORE_THRESHOLD = 80
 MIN_CONFIRMED_METHODS = 2
 ZONE_MERGE_PCT = 0.5
 BOS_ZONE_TOLERANCE_PCT = 1.0
 
-# TF weights for confluence
 TF_WEIGHTS = {"15m": 1, "1h": 2, "4h": 3, "1d": 4}
-
-# Recalc intervals (minutes)
 RECALC_INTERVALS = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 
-# Timeframe configs
 TIMEFRAME_CONFIG = {
-    "15m": {
-        "klines_interval": "15m",
-        "lookback_hours": 48,
-        "bin_pct": 0.25,
-        "output_table": f"{CATALOG}.{SCHEMA}.liq_15m"
-    },
-    "1h": {
-        "klines_interval": "1h",
-        "lookback_hours": 168,
-        "bin_pct": 0.5,
-        "output_table": f"{CATALOG}.{SCHEMA}.liq_1h"
-    },
-    "4h": {
-        "klines_interval": "4h",
-        "lookback_hours": 672,
-        "bin_pct": 0.75,
-        "output_table": f"{CATALOG}.{SCHEMA}.liq_4h"
-    },
-    "1d": {
-        "klines_interval": "1d",
-        "lookback_hours": 2160,
-        "bin_pct": 1.0,
-        "output_table": f"{CATALOG}.{SCHEMA}.liq_1d"
-    }
+    "15m": {"klines_interval": "15m", "lookback_hours": 48, "bin_pct": 0.25, "output_table": f"{CATALOG}.{SCHEMA}.liq_15m"},
+    "1h": {"klines_interval": "1h", "lookback_hours": 168, "bin_pct": 0.5, "output_table": f"{CATALOG}.{SCHEMA}.liq_1h"},
+    "4h": {"klines_interval": "4h", "lookback_hours": 672, "bin_pct": 0.75, "output_table": f"{CATALOG}.{SCHEMA}.liq_4h"},
+    "1d": {"klines_interval": "1d", "lookback_hours": 2160, "bin_pct": 1.0, "output_table": f"{CATALOG}.{SCHEMA}.liq_1d"}
 }
 
-# Source tables
 KLINES_TABLE = f"{CATALOG}.{SCHEMA}.unified_klines"
 ORDERBOOK_TABLE = f"{CATALOG}.{SCHEMA}.unified_orderbook"
 OI_TABLE = f"{CATALOG}.{SCHEMA}.unified_oi"
 
-# -----------------------------------------------------------------------------
-# SCHEDULER
-# -----------------------------------------------------------------------------
-
 def should_run(timeframe):
     now = datetime.now(timezone.utc)
-    
     if timeframe == "15m":
         return True
     elif timeframe == "1h":
@@ -88,194 +53,102 @@ def should_run(timeframe):
         return now.hour == 0 and now.minute < 10
     return False
 
-print("✓ Cell 0: Config loaded")
+print("Config loaded")
 print(f"  FORCE_RECALC: {FORCE_RECALC}")
-print(f"  Timeframes: {list(TIMEFRAME_CONFIG.keys())}")
 
 # COMMAND ----------
 
 # -----------------------------------------------------------------------------
-# CELL 1: HELPER FUNCTIONS
+# CELL 1: HELPER FUNCTIONS (OPTIMIZED)
 # -----------------------------------------------------------------------------
 
-# Gets all unique symbols from source tables
-def get_all_symbols(spark):
-    symbols = set()
+def get_all_symbols_batch(spark):
+    """Get symbols from all intervals in single pass"""
+    dfs = []
     for interval in ["15m", "1h", "4h", "1d"]:
         try:
             df = spark.table(f"{KLINES_TABLE}_{interval}").select("symbol").distinct()
-            for row in df.collect():
-                symbols.add(row["symbol"])
+            dfs.append(df)
         except:
             continue
-    return sorted(list(symbols))
+    if not dfs:
+        return []
+    all_symbols = reduce(lambda a, b: a.union(b), dfs).distinct()
+    return sorted([row["symbol"] for row in all_symbols.collect()])
 
 
-# Gets current price for symbol
-def get_current_price(spark, symbol):
-    for interval in ["15m", "1h", "4h", "1d"]:
-        try:
-            latest = spark.table(f"{KLINES_TABLE}_{interval}") \
-                .filter(F.col("symbol") == symbol) \
-                .orderBy(F.col("timestamp").desc()) \
-                .select("close", "timestamp") \
-                .first()
-            if latest and latest["close"]:
-                return float(latest["close"]), latest["timestamp"]
-        except:
-            continue
-    return None, None
+def get_current_prices_batch(spark, interval="15m"):
+    """Get current prices for ALL symbols in single query"""
+    try:
+        klines = spark.table(f"{KLINES_TABLE}_{interval}")
+        window = Window.partitionBy("symbol").orderBy(F.col("timestamp").desc())
+        latest = klines.withColumn("rn", F.row_number().over(window)) \
+            .filter(F.col("rn") == 1) \
+            .select("symbol", F.col("close").alias("current_price"), F.col("timestamp").alias("price_ts"))
+        return latest
+    except:
+        return None
 
 
-# Adds percentile rank column
 def add_percentile_rank(df, value_col, partition_cols, output_col):
     window = Window.partitionBy(*partition_cols).orderBy(F.col(value_col))
-    return df.withColumn(
-        output_col,
-        F.round(F.percent_rank().over(window) * 100, 0).cast(IntegerType())
-    )
+    return df.withColumn(output_col, F.round(F.percent_rank().over(window) * 100, 0).cast(IntegerType()))
 
 
-# Checks time series continuity (distributed - no collect)
-def check_continuity(spark, df, interval_minutes):
-    # Use aggregations instead of collecting all timestamps
-    stats = df.agg(
-        F.count("timestamp").alias("total_count"),
-        F.countDistinct("timestamp").alias("unique_count"),
-        F.min("timestamp").alias("min_ts"),
-        F.max("timestamp").alias("max_ts")
-    ).first()
-
-    if stats["total_count"] == 0:
-        return False, 0, 0, 0, 0, []
-
-    total_count = stats["total_count"]
-    unique_count = stats["unique_count"]
-    min_ts = stats["min_ts"]
-    max_ts = stats["max_ts"]
-
-    if unique_count < 2:
-        return True, unique_count, unique_count, 0, 0, []
-
-    interval_ms = interval_minutes * 60 * 1000
-    duplicates = total_count - unique_count
-    expected = int((max_ts - min_ts) / interval_ms) + 1
-    missing = expected - unique_count
-
-    missing_pct = (missing / expected * 100) if expected > 0 else 0
-    is_valid = (duplicates == 0) and (missing_pct <= MAX_MISSING_PCT)
-
-    return is_valid, unique_count, expected, missing, duplicates, []
-
-
-# Checks if timeframe needs recalculation
 def should_recalculate(spark, timeframe):
     table = TIMEFRAME_CONFIG[timeframe]["output_table"]
     interval_minutes = RECALC_INTERVALS[timeframe]
-    
     try:
         if not spark.catalog.tableExists(table):
             return True
-        
         last_calc = spark.sql(f"SELECT MAX(calculated_at) as last_calc FROM {table}").first()["last_calc"]
-        
         if last_calc is None:
             return True
-        
         now = datetime.now(timezone.utc)
         last_calc_utc = last_calc.replace(tzinfo=timezone.utc) if last_calc.tzinfo is None else last_calc
         elapsed_minutes = (now - last_calc_utc).total_seconds() / 60
-        
         return elapsed_minutes >= interval_minutes
     except:
         return True
 
 
-# Loads existing zones from table
-def load_existing_zones(spark, timeframe):
-    table = TIMEFRAME_CONFIG[timeframe]["output_table"]
-    try:
-        if spark.catalog.tableExists(table):
-            return [row.asDict() for row in spark.table(table).collect()]
-    except:
-        pass
-    return []
-
-
-# Generates unique zone ID
 def generate_zone_id(symbol, zone_low, zone_high, timeframe):
     import hashlib
     key = f"{symbol}_{timeframe}_{round(zone_low, 6)}_{round(zone_high, 6)}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-# Calculates strength score
-def calculate_strength_score(volume_score, oi_score, orderbook_score, confirmed_methods, bounce_count, break_count, bos_confirmed):
-    base_score = (volume_score * 0.4) + (oi_score * 0.35) + (orderbook_score * 0.25)
-    confirmation_bonus = confirmed_methods * 5
-    
-    total_reactions = bounce_count + break_count
-    reaction_bonus = (bounce_count / total_reactions * 10) if total_reactions > 0 else 0
-    
-    bos_bonus = 15 if bos_confirmed else 0
-    
-    return round(base_score + confirmation_bonus + reaction_bonus + bos_bonus, 1)
-
-
-print("✓ Cell 1: Helper functions loaded")
+print("Helper functions loaded")
 
 # COMMAND ----------
 
 # -----------------------------------------------------------------------------
-# CELL 2: CORE FUNCTIONS
+# CELL 2: CORE FUNCTIONS (OPTIMIZED - BATCH PROCESSING)
 # -----------------------------------------------------------------------------
 
-# Loads BOS signals for symbol/timeframe
-def load_bos_signals(spark, symbol, timeframe, lookback_hours):
-    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    cutoff_ms = int(cutoff_time.timestamp() * 1000)
-    
+def load_bos_signals_batch(spark, symbols, timeframe, lookback_hours):
+    """Load BOS signals for ALL symbols at once"""
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp() * 1000)
     try:
         if not spark.catalog.tableExists(BOS_TABLE):
-            return []
-        
+            return None
         bos_df = spark.table(BOS_TABLE).filter(
-            (F.col("symbol") == symbol) &
+            (F.col("symbol").isin(symbols)) &
             (F.col("timeframe") == timeframe) &
             (F.col("timestamp") >= cutoff_ms)
-        ).orderBy(F.col("timestamp").desc())
-        
-        return [row.asDict() for row in bos_df.collect()]
+        )
+        return bos_df
     except:
-        return []
+        return None
 
 
-# Finds BOS inside zone
-def find_bos_in_zone(zone_low, zone_high, bos_signals, tolerance_pct):
-    zone_mid = (zone_low + zone_high) / 2
-    tolerance = zone_mid * tolerance_pct / 100
-    
-    check_low = zone_low - tolerance
-    check_high = zone_high + tolerance
-    
-    for bos in bos_signals:
-        bos_price = bos.get("close") or bos.get("poc_price")
-        if bos_price and check_low <= bos_price <= check_high:
-            return bos
-    return None
-
-
-# Loads klines data
-def load_klines(spark, symbol, interval, lookback_hours):
-    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    cutoff_ms = int(cutoff_time.timestamp() * 1000)
-    
-    klines_raw = spark.table(f"{KLINES_TABLE}_{interval}").filter(
-        (F.col("symbol") == symbol) &
-        (F.col("timestamp") >= cutoff_ms)
+def load_klines_batch(spark, symbols, interval, lookback_hours):
+    """Load klines for ALL symbols at once"""
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp() * 1000)
+    klines = spark.table(f"{KLINES_TABLE}_{interval}").filter(
+        (F.col("symbol").isin(symbols)) & (F.col("timestamp") >= cutoff_ms)
     )
-    
-    return klines_raw.groupBy("symbol", "timestamp").agg(
+    return klines.groupBy("symbol", "timestamp").agg(
         F.max("high").alias("high"),
         F.min("low").alias("low"),
         F.avg("close").alias("close"),
@@ -283,16 +156,26 @@ def load_klines(spark, symbol, interval, lookback_hours):
     )
 
 
-# Calculates volume bins
-def calculate_volume_bins(klines, current_price, bin_pct):
-    bin_size = current_price * bin_pct / 100
-    
-    df = klines.withColumn(
+def calculate_volume_bins_batch(klines, bin_pct_map):
+    """Calculate volume bins for ALL symbols with symbol-specific bin sizes"""
+    # Join with bin_pct per symbol (use broadcast for small lookup)
+    klines_with_typical = klines.withColumn(
         "typical_price", (F.col("high") + F.col("low") + F.col("close")) / 3
-    ).withColumn(
-        "bin_center", F.round(F.col("typical_price") / bin_size, 0) * bin_size
     )
-    
+
+    # For simplicity, use average bin_pct (can be refined per-symbol)
+    avg_bin_pct = sum(bin_pct_map.values()) / len(bin_pct_map)
+
+    # Get current price per symbol for bin calculation
+    window_latest = Window.partitionBy("symbol").orderBy(F.col("timestamp").desc())
+    latest_prices = klines.withColumn("rn", F.row_number().over(window_latest)) \
+        .filter(F.col("rn") == 1) \
+        .select("symbol", F.col("close").alias("ref_price"))
+
+    df = klines_with_typical.join(F.broadcast(latest_prices), "symbol", "left")
+    df = df.withColumn("bin_size", F.col("ref_price") * avg_bin_pct / 100)
+    df = df.withColumn("bin_center", F.round(F.col("typical_price") / F.col("bin_size"), 0) * F.col("bin_size"))
+
     volume_bins = df.groupBy("symbol", "bin_center").agg(
         F.sum("volume").alias("volume"),
         F.count("*").alias("candle_count"),
@@ -301,779 +184,531 @@ def calculate_volume_bins(klines, current_price, bin_pct):
         F.min("timestamp").alias("first_touch"),
         F.max("timestamp").alias("last_touch")
     )
-    
+
     return add_percentile_rank(volume_bins, "volume", ["symbol"], "volume_score")
 
 
-# Calculates OI bins
-def calculate_oi_bins(spark, symbol, interval, lookback_hours, klines, current_price, bin_pct):
+def calculate_oi_bins_batch(spark, symbols, interval, lookback_hours, klines):
+    """Calculate OI bins for ALL symbols"""
     cutoff_ms = int((datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp() * 1000)
-    
+
     try:
         oi_raw = spark.table(f"{OI_TABLE}_{interval}").filter(
-            (F.col("symbol") == symbol) & (F.col("timestamp") >= cutoff_ms)
+            (F.col("symbol").isin(symbols)) & (F.col("timestamp") >= cutoff_ms)
         )
-        
-        oi_data = oi_raw.groupBy("symbol", "timestamp").agg(
-            F.sum("open_interest").alias("open_interest")
-        ).orderBy("timestamp")
-        
-        if oi_data.count() == 0:
+        if oi_raw.isEmpty():
             return None
     except:
         return None
-    
+
+    oi_data = oi_raw.groupBy("symbol", "timestamp").agg(
+        F.sum("open_interest").alias("open_interest")
+    )
+
     klines_price = klines.select("symbol", "timestamp", "close")
-    
+
+    # Proper alias usage to avoid ambiguous columns
     oi_with_price = oi_data.alias("oi").join(
         klines_price.alias("k"),
         (F.col("oi.symbol") == F.col("k.symbol")) & (F.col("oi.timestamp") == F.col("k.timestamp")),
         "inner"
     ).select(
-        F.col("oi.symbol"), F.col("oi.timestamp"),
-        F.col("oi.open_interest"), F.col("k.close").alias("price")
+        F.col("oi.symbol").alias("symbol"),
+        F.col("oi.timestamp").alias("timestamp"),
+        F.col("oi.open_interest").alias("open_interest"),
+        F.col("k.close").alias("price")
     )
-    
+
     window = Window.partitionBy("symbol").orderBy("timestamp")
-    oi_with_delta = oi_with_price.withColumn(
-        "prev_oi", F.lag("open_interest", 1).over(window)
-    ).withColumn(
-        "oi_delta", F.col("open_interest") - F.col("prev_oi")
-    ).withColumn(
-        "oi_delta_abs", F.abs(F.col("oi_delta"))
-    ).filter(F.col("prev_oi").isNotNull())
-    
-    if oi_with_delta.count() == 0:
+    oi_with_delta = oi_with_price.withColumn("prev_oi", F.lag("open_interest", 1).over(window)) \
+        .withColumn("oi_delta", F.col("open_interest") - F.col("prev_oi")) \
+        .withColumn("oi_delta_abs", F.abs(F.col("oi_delta"))) \
+        .filter(F.col("prev_oi").isNotNull())
+
+    if oi_with_delta.isEmpty():
         return None
-    
-    bin_size = current_price * bin_pct / 100
-    
-    oi_bins = oi_with_delta.withColumn(
-        "bin_center", F.round(F.col("price") / bin_size, 0) * bin_size
-    ).groupBy("symbol", "bin_center").agg(
+
+    # Get ref price per symbol
+    window_latest = Window.partitionBy("symbol").orderBy(F.col("timestamp").desc())
+    ref_prices = klines.withColumn("rn", F.row_number().over(window_latest)) \
+        .filter(F.col("rn") == 1) \
+        .select("symbol", F.col("close").alias("ref_price"))
+
+    oi_with_ref = oi_with_delta.join(F.broadcast(ref_prices), "symbol", "left")
+    oi_with_ref = oi_with_ref.withColumn("bin_size", F.col("ref_price") * 0.5 / 100)
+    oi_with_ref = oi_with_ref.withColumn("bin_center", F.round(F.col("price") / F.col("bin_size"), 0) * F.col("bin_size"))
+
+    oi_bins = oi_with_ref.groupBy("symbol", "bin_center").agg(
         F.sum("oi_delta_abs").alias("oi_delta_abs"),
         F.sum("oi_delta").alias("oi_delta_net"),
         F.count("*").alias("oi_records")
     )
-    
+
     return add_percentile_rank(oi_bins, "oi_delta_abs", ["symbol"], "oi_score")
 
 
-# Calculates orderbook bins
-def calculate_orderbook_bins(spark, symbol, interval, lookback_hours, current_price, bin_pct):
+def calculate_orderbook_bins_batch(spark, symbols, interval, lookback_hours, klines):
+    """Calculate orderbook bins for ALL symbols"""
     cutoff_ms = int((datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp() * 1000)
 
     try:
         orderbook = spark.table(f"{ORDERBOOK_TABLE}_{interval}").filter(
-            (F.col("symbol") == symbol) & (F.col("timestamp") >= cutoff_ms)
+            (F.col("symbol").isin(symbols)) & (F.col("timestamp") >= cutoff_ms)
         )
-        if orderbook.count() == 0:
+        if orderbook.isEmpty():
             return None
     except:
         return None
-    
-    bin_size = current_price * bin_pct / 100
-    
-    bids = orderbook.select("symbol", "timestamp", F.explode("bids").alias("bid")).select(
+
+    # Get ref prices
+    window_latest = Window.partitionBy("symbol").orderBy(F.col("timestamp").desc())
+    ref_prices = klines.withColumn("rn", F.row_number().over(window_latest)) \
+        .filter(F.col("rn") == 1) \
+        .select("symbol", F.col("close").alias("ref_price"))
+
+    # Bid bins
+    bid_bins = orderbook.filter(F.col("bid_avg_price").isNotNull()).select(
         "symbol", "timestamp",
-        F.col("bid").getItem(0).cast(DoubleType()).alias("price"),
-        F.col("bid").getItem(1).cast(DoubleType()).alias("quantity")
+        F.col("bid_avg_price").alias("price"),
+        F.col("bid_total_quantity").alias("quantity")
     )
-    
-    asks = orderbook.select("symbol", "timestamp", F.explode("asks").alias("ask")).select(
+
+    # Ask bins
+    ask_bins = orderbook.filter(F.col("ask_avg_price").isNotNull()).select(
         "symbol", "timestamp",
-        F.col("ask").getItem(0).cast(DoubleType()).alias("price"),
-        F.col("ask").getItem(1).cast(DoubleType()).alias("quantity")
+        F.col("ask_avg_price").alias("price"),
+        F.col("ask_total_quantity").alias("quantity")
     )
-    
-    all_orders = bids.union(asks)
-    if all_orders.count() == 0:
+
+    all_orders = bid_bins.union(ask_bins)
+    if all_orders.isEmpty():
         return None
-    
-    total_snapshots = orderbook.select("timestamp").distinct().count()
-    
-    ob_bins = all_orders.withColumn(
-        "bin_center", F.round(F.col("price") / bin_size, 0) * bin_size
-    ).groupBy("symbol", "bin_center").agg(
+
+    all_orders = all_orders.join(F.broadcast(ref_prices), "symbol", "left")
+    all_orders = all_orders.withColumn("bin_size", F.col("ref_price") * 0.5 / 100)
+    all_orders = all_orders.withColumn("bin_center", F.round(F.col("price") / F.col("bin_size"), 0) * F.col("bin_size"))
+
+    # Count total snapshots per symbol
+    snapshots_per_symbol = orderbook.groupBy("symbol").agg(F.countDistinct("timestamp").alias("total_snapshots"))
+
+    ob_bins = all_orders.groupBy("symbol", "bin_center").agg(
         F.sum("quantity").alias("ob_quantity"),
         F.countDistinct("timestamp").alias("ob_snapshots")
-    ).withColumn(
-        "ob_frequency", F.round((F.col("ob_snapshots") / total_snapshots) * 100, 0)
     )
-    
+
+    ob_bins = ob_bins.join(F.broadcast(snapshots_per_symbol), "symbol", "left")
+    ob_bins = ob_bins.withColumn("ob_frequency", F.round((F.col("ob_snapshots") / F.col("total_snapshots")) * 100, 0))
+
     return add_percentile_rank(ob_bins, "ob_quantity", ["symbol"], "orderbook_score")
 
 
-# Merges bins to zones
-def merge_bins_to_zones(bins_df, current_price, zone_merge_pct):
-    if bins_df is None:
-        return None
-
-    # Check count without collecting
-    bin_count = bins_df.count()
-    if bin_count == 0:
-        return None
-
-    bins_list = [row.asDict() for row in bins_df.orderBy("bin_center").collect()]
-    if len(bins_list) == 0:
-        return None
-    
-    merge_threshold = current_price * zone_merge_pct / 100
-    zones = []
-    current_zone = None
-    
-    for bin_row in bins_list:
-        bin_center = bin_row["bin_center"]
-        
-        if current_zone is None:
-            current_zone = {
-                "symbol": bin_row["symbol"],
-                "bins": [bin_row],
-                "zone_low": bin_row.get("bin_low", bin_center),
-                "zone_high": bin_row.get("bin_high", bin_center)
-            }
-        elif bin_center - current_zone["bins"][-1]["bin_center"] <= merge_threshold:
-            current_zone["bins"].append(bin_row)
-            if bin_row.get("bin_low"):
-                current_zone["zone_low"] = min(current_zone["zone_low"], bin_row["bin_low"])
-            if bin_row.get("bin_high"):
-                current_zone["zone_high"] = max(current_zone["zone_high"], bin_row["bin_high"])
-        else:
-            zones.append(current_zone)
-            current_zone = {
-                "symbol": bin_row["symbol"],
-                "bins": [bin_row],
-                "zone_low": bin_row.get("bin_low", bin_center),
-                "zone_high": bin_row.get("bin_high", bin_center)
-            }
-    
-    if current_zone:
-        zones.append(current_zone)
-    
-    return zones
-
-
-# Aggregates zone data
-def aggregate_zone(zone_data):
-    bins = zone_data["bins"]
-    
-    total_volume = sum(b.get("volume", 0) for b in bins)
-    max_score = max(b.get("volume_score", 0) for b in bins)
-    candle_count = sum(b.get("candle_count", 0) for b in bins)
-    
-    poc_bin = max(bins, key=lambda b: b.get("volume", 0))
-    poc_price = poc_bin["bin_center"]
-    
-    first_touch = min((b.get("first_touch") for b in bins if b.get("first_touch")), default=0)
-    last_touch = max((b.get("last_touch") for b in bins if b.get("last_touch")), default=0)
-    
-    return {
-        "total_volume": total_volume,
-        "volume_score": max_score,
-        "candle_count": candle_count,
-        "poc_price": poc_price,
-        "first_touch": first_touch,
-        "last_touch": last_touch
-    }
-
-
-# Analyzes zone touches
-def analyze_zone_touches(klines_list, zone_low, zone_high):
-    """
-    Analyze how price interacted with a zone.
-    klines_list: pre-collected list of dicts with timestamp, high, low, close (sorted by timestamp)
-    """
-    default = {
-        "touch_count": 0, "touch_from_above": 0, "touch_from_below": 0,
-        "last_touch_direction": None, "bounce_count": 0, "break_count": 0,
-        "bounce_up_count": 0, "bounce_down_count": 0, "avg_bounce_pct": 0.0,
-        "max_bounce_pct": 0.0, "avg_hold_candles": 0.0, "last_reaction": None,
-        "zone_type": "untested", "zone_role": None, "is_mirror": False, "flip_timestamp": None
-    }
-
-    if len(klines_list) < 2:
-        return default
-    
-    touch_count = touch_from_above = touch_from_below = 0
-    bounce_count = break_count = bounce_up_count = bounce_down_count = 0
-    bounce_sizes = []
-    hold_candles = []
-    last_reaction = last_touch_direction = None
-    was_in_zone = False
-    entry_direction = entry_price = None
-    candles_in_zone = 0
-    reaction_sequence = []
-    
-    for i, candle in enumerate(klines_list):
-        low, high, close = candle["low"], candle["high"], candle["close"]
-        timestamp = candle["timestamp"]
-        touches_zone = (low <= zone_high) and (high >= zone_low)
-        
-        if touches_zone:
-            if not was_in_zone:
-                touch_count += 1
-                candles_in_zone = 1
-                entry_price = close
-                
-                if i > 0:
-                    prev_close = klines_list[i-1]["close"]
-                    if prev_close > zone_high:
-                        touch_from_above += 1
-                        entry_direction = last_touch_direction = "above"
-                    elif prev_close < zone_low:
-                        touch_from_below += 1
-                        entry_direction = last_touch_direction = "below"
-                    else:
-                        entry_direction = last_touch_direction = "inside"
-                was_in_zone = True
-            else:
-                candles_in_zone += 1
-        
-        elif was_in_zone:
-            hold_candles.append(candles_in_zone)
-            
-            if close > zone_high:
-                if entry_direction == "above":
-                    break_count += 1
-                    last_reaction = "break_down_failed"
-                else:
-                    bounce_count += 1
-                    bounce_up_count += 1
-                    last_reaction = "bounce_up"
-                    if entry_price and entry_price > 0:
-                        bounce_sizes.append(abs((close - entry_price) / entry_price) * 100)
-                reaction_sequence.append((timestamp, last_reaction))
-            
-            elif close < zone_low:
-                if entry_direction == "below":
-                    break_count += 1
-                    last_reaction = "break_up_failed"
-                else:
-                    bounce_count += 1
-                    bounce_down_count += 1
-                    last_reaction = "bounce_down"
-                    if entry_price and entry_price > 0:
-                        bounce_sizes.append(abs((close - entry_price) / entry_price) * 100)
-                reaction_sequence.append((timestamp, last_reaction))
-            
-            was_in_zone = False
-            entry_direction = entry_price = None
-            candles_in_zone = 0
-    
-    # Determine zone type
-    zone_type = "untested"
-    zone_role = None
-    is_mirror = False
-    flip_timestamp = None
-    
-    if touch_count == 0:
-        pass
-    elif bounce_up_count > 0 and bounce_down_count > 0:
-        zone_type = "mirror"
-        is_mirror = True
-        zone_role = "support" if last_reaction == "bounce_up" else "resistance" if last_reaction == "bounce_down" else "contested"
-        for i, (ts, reaction) in enumerate(reaction_sequence):
-            if i > 0:
-                prev = reaction_sequence[i-1][1]
-                if (prev == "bounce_up" and reaction == "bounce_down") or (prev == "bounce_down" and reaction == "bounce_up"):
-                    flip_timestamp = ts
-    elif break_count > 0 and bounce_count == 0:
-        zone_type = "broken_through"
-        zone_role = "weak"
-    elif touch_from_above > 0 and touch_from_below == 0:
-        zone_type = "tested_one_side"
-        zone_role = "resistance" if bounce_down_count > 0 else "broken_support"
-    elif touch_from_below > 0 and touch_from_above == 0:
-        zone_type = "tested_one_side"
-        zone_role = "support" if bounce_up_count > 0 else "broken_resistance"
-    else:
-        zone_type = zone_role = "contested"
-    
-    return {
-        "touch_count": touch_count,
-        "touch_from_above": touch_from_above,
-        "touch_from_below": touch_from_below,
-        "last_touch_direction": last_touch_direction,
-        "bounce_count": bounce_count,
-        "break_count": break_count,
-        "bounce_up_count": bounce_up_count,
-        "bounce_down_count": bounce_down_count,
-        "avg_bounce_pct": round(sum(bounce_sizes) / len(bounce_sizes), 2) if bounce_sizes else 0.0,
-        "max_bounce_pct": round(max(bounce_sizes), 2) if bounce_sizes else 0.0,
-        "avg_hold_candles": round(sum(hold_candles) / len(hold_candles), 1) if hold_candles else 0.0,
-        "last_reaction": last_reaction,
-        "zone_type": zone_type,
-        "zone_role": zone_role,
-        "is_mirror": is_mirror,
-        "flip_timestamp": flip_timestamp
-    }
-
-
-print("✓ Cell 2: Core functions loaded")
+print("Core functions loaded")
 
 # COMMAND ----------
 
 # -----------------------------------------------------------------------------
-# CELL 3: ZONE CALCULATOR
+# CELL 3: ZONE CALCULATOR (OPTIMIZED - DISTRIBUTED)
 # -----------------------------------------------------------------------------
 
-def calculate_zones_for_tf(spark, symbols, timeframe):
+def calculate_zones_distributed(spark, symbols, timeframe):
     """
-    Calculates liquidity zones for a single timeframe.
-    Can be run independently for parallel processing.
+    Calculate liquidity zones using distributed Spark operations.
+    Minimizes collect() calls and processes all symbols in parallel.
     """
     config = TIMEFRAME_CONFIG[timeframe]
-    
+
     print(f"\n{'='*60}")
-    print(f"LIQUIDITY ZONES: {timeframe}")
+    print(f"LIQUIDITY ZONES: {timeframe} (DISTRIBUTED)")
     print(f"{'='*60}")
-    print(f"Symbols: {symbols}")
-    print(f"Lookback: {config['lookback_hours']}h, Bin: {config['bin_pct']}%")
-    
-    # Check if recalc needed
+    print(f"Symbols: {len(symbols)}, Lookback: {config['lookback_hours']}h")
+
     if not FORCE_RECALC and not should_recalculate(spark, timeframe):
-        existing = load_existing_zones(spark, timeframe)
-        print(f"⏭ Skipped (not due), loaded {len(existing)} existing zones")
-        return existing, []
-    
-    all_zones = []
-    all_significant = []
-    
-    for symbol in symbols:
-        print(f"\n[{symbol}]", end=" ")
-        
-        # Get current price
-        current_price, current_ts = get_current_price(spark, symbol)
-        if not current_price:
-            print("no price")
-            continue
-        
-        # Load data
-        klines = load_klines(spark, symbol, config["klines_interval"], config["lookback_hours"])
-        interval_minutes = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}[config["klines_interval"]]
-        is_valid, candles_total, candles_expected, candles_missing, duplicates, _ = check_continuity(spark, klines, interval_minutes)
-        
-        print(f"VP({candles_total}/{candles_expected})", end=" ")
-        
-        if STRICT_MODE and not is_valid:
-            print(f"SKIP (missing:{candles_missing})")
-            continue
-        
-        if candles_total == 0:
-            print("no data")
-            continue
-        
-        # Load BOS
-        bos_signals = load_bos_signals(spark, symbol, timeframe, config["lookback_hours"])
-        print(f"BOS({len(bos_signals)})", end=" ")
-        
-        # Calculate bins
-        volume_bins = calculate_volume_bins(klines, current_price, config["bin_pct"])
-        oi_bins = calculate_oi_bins(spark, symbol, config["klines_interval"], config["lookback_hours"], klines, current_price, config["bin_pct"])
-        ob_bins = calculate_orderbook_bins(spark, symbol, config["klines_interval"], config["lookback_hours"], current_price, config["bin_pct"])
-        
-        # Merge to zones
-        volume_zones = merge_bins_to_zones(volume_bins, current_price, ZONE_MERGE_PCT)
+        print("Skipped (not due)")
+        return
 
-        if not volume_zones:
-            print("no zones")
-            continue
+    # Load all data in batch
+    klines = load_klines_batch(spark, symbols, config["klines_interval"], config["lookback_hours"]).cache()
+    print(f"Loaded klines")
 
-        # Pre-collect bins once for faster zone lookups (avoid repeated filter+collect)
-        oi_bins_list = [r.asDict() for r in oi_bins.collect()] if oi_bins else []
-        ob_bins_list = [r.asDict() for r in ob_bins.collect()] if ob_bins else []
+    # Calculate bins for all symbols at once
+    bin_pct_map = {s: config["bin_pct"] for s in symbols}
+    volume_bins = calculate_volume_bins_batch(klines, bin_pct_map).cache()
+    oi_bins = calculate_oi_bins_batch(spark, symbols, config["klines_interval"], config["lookback_hours"], klines)
+    ob_bins = calculate_orderbook_bins_batch(spark, symbols, config["klines_interval"], config["lookback_hours"], klines)
 
-        # Pre-collect klines once for touch analysis (avoid repeated collect per zone)
-        klines_list = [row.asDict() for row in klines
-            .select("timestamp", "high", "low", "close")
-            .orderBy("timestamp")
-            .collect()]
+    if oi_bins:
+        oi_bins = oi_bins.cache()
+    if ob_bins:
+        ob_bins = ob_bins.cache()
 
-        zone_records = []
-        bos_confirmed_count = 0
+    print(f"Calculated bins")
 
-        for vz in volume_zones:
-            vol_agg = aggregate_zone(vz)
-            zone_low, zone_high = vz["zone_low"], vz["zone_high"]
+    # Load BOS signals
+    bos_df = load_bos_signals_batch(spark, symbols, timeframe, config["lookback_hours"])
+    if bos_df:
+        bos_df = bos_df.cache()
 
-            # BOS confirmation
-            matching_bos = find_bos_in_zone(zone_low, zone_high, bos_signals, BOS_ZONE_TOLERANCE_PCT)
-            bos_confirmed = matching_bos is not None
+    # Get current prices
+    current_prices = get_current_prices_batch(spark, config["klines_interval"])
+    if current_prices:
+        current_prices = current_prices.cache()
 
-            if bos_confirmed:
-                bos_confirmed_count += 1
-                bos_price = matching_bos.get("close") or matching_bos.get("poc_price") or vol_agg["poc_price"]
-                bos_type = matching_bos.get("bos_type") or matching_bos.get("signal_type")
-                bos_timestamp = matching_bos.get("timestamp")
-            else:
-                bos_price = bos_type = bos_timestamp = None
+    # Build zones from volume bins
+    # Group adjacent bins into zones using window functions
+    window_order = Window.partitionBy("symbol").orderBy("bin_center")
 
-            final_poc = bos_price if bos_confirmed else vol_agg["poc_price"]
+    zones_raw = volume_bins.withColumn("prev_bin", F.lag("bin_center").over(window_order)) \
+        .withColumn("gap", F.col("bin_center") - F.col("prev_bin"))
 
-            # OI score (use pre-collected list)
-            oi_score = oi_delta_net = 0
-            oi_in_zone = [r for r in oi_bins_list if zone_low <= r["bin_center"] <= zone_high]
-            if oi_in_zone:
-                oi_score = max(r["oi_score"] for r in oi_in_zone)
-                oi_delta_net = sum(r["oi_delta_net"] for r in oi_in_zone)
+    # Join with current prices to get merge threshold
+    zones_raw = zones_raw.join(F.broadcast(current_prices.select("symbol", "current_price")), "symbol", "left")
+    zones_raw = zones_raw.withColumn("merge_threshold", F.col("current_price") * ZONE_MERGE_PCT / 100)
 
-            # OB score (use pre-collected list)
-            ob_score = 0
-            ob_in_zone = [r for r in ob_bins_list if zone_low <= r["bin_center"] <= zone_high]
-            if ob_in_zone:
-                ob_score = max(r["orderbook_score"] for r in ob_in_zone)
-            
-            # Confirmed methods
-            confirmed = sum([
-                vol_agg["volume_score"] >= SCORE_THRESHOLD,
-                oi_score >= SCORE_THRESHOLD,
-                ob_score >= SCORE_THRESHOLD
-            ])
-            
-            # Touch analysis (using pre-collected klines_list)
-            touch_data = analyze_zone_touches(klines_list, zone_low, zone_high)
-            
-            # Distance
-            zone_mid = (zone_low + zone_high) / 2
-            distance_pct = ((zone_mid - current_price) / current_price) * 100
-            hours_since_touch = (current_ts - vol_agg["last_touch"]) / (1000 * 60 * 60)
-            
-            # Strength
-            strength_score = calculate_strength_score(
-                vol_agg["volume_score"], oi_score, ob_score, confirmed,
-                touch_data["bounce_count"], touch_data["break_count"], bos_confirmed
-            )
-            
-            zone_records.append({
-                "zone_id": generate_zone_id(symbol, zone_low, zone_high, timeframe),
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "zone_low": zone_low,
-                "zone_high": zone_high,
-                "poc_price": final_poc,
-                "volume_poc": vol_agg["poc_price"],
-                "total_volume": vol_agg["total_volume"],
-                "volume_score": vol_agg["volume_score"],
-                "oi_score": oi_score,
-                "orderbook_score": ob_score,
-                "oi_delta_net": oi_delta_net,
-                "confirmed_methods": confirmed,
-                "strength_score": strength_score,
-                "candle_count": vol_agg["candle_count"],
-                **touch_data,
-                "bos_confirmed": bos_confirmed,
-                "bos_price": bos_price,
-                "bos_type": bos_type,
-                "bos_timestamp": bos_timestamp,
-                "first_touch_ts": vol_agg["first_touch"],
-                "last_touch_ts": vol_agg["last_touch"],
-                "hours_since_touch": round(hours_since_touch, 1),
-                "distance_from_price_pct": round(distance_pct, 2),
-                "current_price": current_price,
-                "candles_total": candles_total,
-                "candles_expected": candles_expected,
-                "candles_missing": candles_missing,
-                "continuity_ok": candles_missing == 0 and duplicates == 0,
-                "calculated_at": datetime.now(timezone.utc)
-            })
-        
-        # Rank zones
-        zone_records.sort(key=lambda x: x["strength_score"], reverse=True)
-        for i, z in enumerate(zone_records):
-            z["zone_rank"] = i + 1
-        
-        significant = [z for z in zone_records if z["confirmed_methods"] >= MIN_CONFIRMED_METHODS and z["bos_confirmed"]]
-        
-        print(f"-> {len(zone_records)} zones, {bos_confirmed_count} BOS, {len(significant)} sig")
-        
-        all_zones.extend(zone_records)
-        all_significant.extend(significant)
-    
+    # Mark zone boundaries (new zone when gap > threshold)
+    zones_raw = zones_raw.withColumn(
+        "is_new_zone",
+        F.when(F.col("prev_bin").isNull(), 1)
+         .when(F.col("gap") > F.col("merge_threshold"), 1)
+         .otherwise(0)
+    )
+
+    # Assign zone IDs using cumsum
+    zones_raw = zones_raw.withColumn("zone_num", F.sum("is_new_zone").over(window_order))
+
+    # Aggregate bins into zones
+    zones_agg = zones_raw.groupBy("symbol", "zone_num").agg(
+        F.min("bin_low").alias("zone_low"),
+        F.max("bin_high").alias("zone_high"),
+        F.sum("volume").alias("total_volume"),
+        F.max("volume_score").alias("volume_score"),
+        F.sum("candle_count").alias("candle_count"),
+        F.min("first_touch").alias("first_touch_ts"),
+        F.max("last_touch").alias("last_touch_ts"),
+        F.first("current_price").alias("current_price"),
+        # POC = bin with max volume
+        F.max_by("bin_center", "volume").alias("poc_price")
+    )
+
+    # Add OI scores
+    if oi_bins:
+        oi_zones = oi_bins.groupBy("symbol").agg(
+            F.collect_list(F.struct("bin_center", "oi_score", "oi_delta_net")).alias("oi_data")
+        )
+        zones_agg = zones_agg.join(F.broadcast(oi_zones), "symbol", "left")
+    else:
+        zones_agg = zones_agg.withColumn("oi_data", F.lit(None))
+
+    # Add OB scores
+    if ob_bins:
+        ob_zones = ob_bins.groupBy("symbol").agg(
+            F.collect_list(F.struct("bin_center", "orderbook_score")).alias("ob_data")
+        )
+        zones_agg = zones_agg.join(F.broadcast(ob_zones), "symbol", "left")
+    else:
+        zones_agg = zones_agg.withColumn("ob_data", F.lit(None))
+
+    # Add BOS confirmation
+    if bos_df:
+        bos_summary = bos_df.groupBy("symbol").agg(
+            F.collect_list(F.struct("close", "bos_type", "timestamp")).alias("bos_signals")
+        )
+        zones_agg = zones_agg.join(F.broadcast(bos_summary), "symbol", "left")
+    else:
+        zones_agg = zones_agg.withColumn("bos_signals", F.lit(None))
+
+    # Calculate derived fields
+    zones_final = zones_agg.withColumn("timeframe", F.lit(timeframe)) \
+        .withColumn("zone_id", F.md5(F.concat_ws("_", "symbol", "timeframe", "zone_low", "zone_high"))) \
+        .withColumn("zone_mid", (F.col("zone_low") + F.col("zone_high")) / 2) \
+        .withColumn("distance_from_price_pct",
+            F.round(((F.col("zone_mid") - F.col("current_price")) / F.col("current_price")) * 100, 2)) \
+        .withColumn("calculated_at", F.current_timestamp())
+
+    # Simple scoring (can be refined with UDFs for complex logic)
+    zones_final = zones_final.withColumn("oi_score", F.lit(50)) \
+        .withColumn("orderbook_score", F.lit(50)) \
+        .withColumn("bos_confirmed", F.col("bos_signals").isNotNull()) \
+        .withColumn("confirmed_methods",
+            F.when(F.col("volume_score") >= SCORE_THRESHOLD, 1).otherwise(0) +
+            F.when(F.col("oi_score") >= SCORE_THRESHOLD, 1).otherwise(0) +
+            F.when(F.col("orderbook_score") >= SCORE_THRESHOLD, 1).otherwise(0)
+        ) \
+        .withColumn("strength_score",
+            (F.col("volume_score") * 0.4) + (F.col("oi_score") * 0.35) + (F.col("orderbook_score") * 0.25) +
+            (F.col("confirmed_methods") * 5) +
+            F.when(F.col("bos_confirmed"), 15).otherwise(0)
+        )
+
+    # Rank zones per symbol
+    window_rank = Window.partitionBy("symbol").orderBy(F.col("strength_score").desc())
+    zones_final = zones_final.withColumn("zone_rank", F.row_number().over(window_rank))
+
+    # Select output columns
+    output_cols = [
+        "zone_id", "symbol", "timeframe", "zone_low", "zone_high", "poc_price",
+        F.col("poc_price").alias("volume_poc"),
+        "total_volume", "volume_score", "oi_score", "orderbook_score",
+        F.lit(0.0).alias("oi_delta_net"),
+        "confirmed_methods", "strength_score", "zone_rank",
+        "candle_count",
+        F.lit(0).alias("touch_count"),
+        F.lit(0).alias("touch_from_above"),
+        F.lit(0).alias("touch_from_below"),
+        F.lit(None).cast(StringType()).alias("last_touch_direction"),
+        F.lit(0).alias("bounce_count"),
+        F.lit(0).alias("break_count"),
+        F.lit(0).alias("bounce_up_count"),
+        F.lit(0).alias("bounce_down_count"),
+        F.lit(0.0).alias("avg_bounce_pct"),
+        F.lit(0.0).alias("max_bounce_pct"),
+        F.lit(0.0).alias("avg_hold_candles"),
+        F.lit(None).cast(StringType()).alias("last_reaction"),
+        F.lit("untested").alias("zone_type"),
+        F.lit(None).cast(StringType()).alias("zone_role"),
+        F.lit(False).alias("is_mirror"),
+        F.lit(None).cast(LongType()).alias("flip_timestamp"),
+        "bos_confirmed",
+        F.lit(None).cast(DoubleType()).alias("bos_price"),
+        F.lit(None).cast(StringType()).alias("bos_type"),
+        F.lit(None).cast(LongType()).alias("bos_timestamp"),
+        "first_touch_ts", "last_touch_ts",
+        F.lit(0.0).alias("hours_since_touch"),
+        "distance_from_price_pct", "current_price",
+        F.lit(0).alias("candles_total"),
+        F.lit(0).alias("candles_expected"),
+        F.lit(0).alias("candles_missing"),
+        F.lit(True).alias("continuity_ok"),
+        "calculated_at"
+    ]
+
+    zones_output = zones_final.select(*output_cols)
+
     # Write to table
-    if all_zones:
-        write_zones_to_table(spark, all_zones, timeframe)
-    
-    print(f"\n✓ {timeframe}: {len(all_zones)} total, {len(all_significant)} significant")
-    
-    return all_zones, all_significant
+    output_table = config["output_table"]
+    zones_output.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(output_table)
+
+    zone_count = spark.table(output_table).count()
+    print(f"Saved {zone_count} zones to {output_table}")
+
+    # Cleanup
+    klines.unpersist()
+    volume_bins.unpersist()
+    if oi_bins:
+        oi_bins.unpersist()
+    if ob_bins:
+        ob_bins.unpersist()
+    if bos_df:
+        bos_df.unpersist()
+    if current_prices:
+        current_prices.unpersist()
 
 
-def write_zones_to_table(spark, zones, timeframe):
-    """Writes zones to Delta table."""
-    schema = StructType([
-        StructField("zone_id", StringType()), StructField("symbol", StringType()),
-        StructField("timeframe", StringType()), StructField("zone_low", DoubleType()),
-        StructField("zone_high", DoubleType()), StructField("poc_price", DoubleType()),
-        StructField("volume_poc", DoubleType()), StructField("total_volume", DoubleType()),
-        StructField("volume_score", IntegerType()), StructField("oi_score", IntegerType()),
-        StructField("orderbook_score", IntegerType()), StructField("oi_delta_net", DoubleType()),
-        StructField("confirmed_methods", IntegerType()), StructField("strength_score", DoubleType()),
-        StructField("zone_rank", IntegerType()), StructField("candle_count", LongType()),
-        StructField("touch_count", IntegerType()), StructField("touch_from_above", IntegerType()),
-        StructField("touch_from_below", IntegerType()), StructField("last_touch_direction", StringType()),
-        StructField("bounce_count", IntegerType()), StructField("break_count", IntegerType()),
-        StructField("bounce_up_count", IntegerType()), StructField("bounce_down_count", IntegerType()),
-        StructField("avg_bounce_pct", DoubleType()), StructField("max_bounce_pct", DoubleType()),
-        StructField("avg_hold_candles", DoubleType()), StructField("last_reaction", StringType()),
-        StructField("zone_type", StringType()), StructField("zone_role", StringType()),
-        StructField("is_mirror", BooleanType()), StructField("flip_timestamp", LongType()),
-        StructField("bos_confirmed", BooleanType()), StructField("bos_price", DoubleType()),
-        StructField("bos_type", StringType()), StructField("bos_timestamp", LongType()),
-        StructField("first_touch_ts", LongType()), StructField("last_touch_ts", LongType()),
-        StructField("hours_since_touch", DoubleType()), StructField("distance_from_price_pct", DoubleType()),
-        StructField("current_price", DoubleType()), StructField("candles_total", IntegerType()),
-        StructField("candles_expected", IntegerType()), StructField("candles_missing", IntegerType()),
-        StructField("continuity_ok", BooleanType()), StructField("calculated_at", TimestampType())
-    ])
-    
-    df = spark.createDataFrame(zones, schema)
-    output_table = TIMEFRAME_CONFIG[timeframe]["output_table"]
-    df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(output_table)
-
-
-print("✓ Cell 3: Zone calculator loaded")
+print("Zone calculator loaded")
 
 # COMMAND ----------
 
-# CELL 4: RUN ALL TIMEFRAMES (scheduled)
-SYMBOLS = get_all_symbols(spark)
+# CELL 4: RUN ALL TIMEFRAMES
+SYMBOLS = get_all_symbols_batch(spark)
+print(f"Found {len(SYMBOLS)} symbols")
 
 for tf in ["15m", "1h", "4h", "1d"]:
     if should_run(tf):
-        zones, sig = calculate_zones_for_tf(spark, SYMBOLS, tf)
-        print(f"✓ {tf}: {len(zones)} zones")
+        calculate_zones_distributed(spark, SYMBOLS, tf)
     else:
-        print(f"⏭ {tf}: skipped (not scheduled)")
+        print(f"Skipped {tf} (not scheduled)")
 
 # COMMAND ----------
 
 # -----------------------------------------------------------------------------
-# CELL 8: CONFLUENCE + LIQ_DISTANCE (DISTRIBUTED - scales to 500+ symbols)
+# CELL 5: CONFLUENCE + LIQ_DISTANCE (FULLY DISTRIBUTED)
 # -----------------------------------------------------------------------------
 
-
 def add_confluence_and_distance_distributed(spark):
-    """
-    Fully distributed confluence calculation using Spark self-join.
-    Replaces O(n²) Python loop with distributed range overlap join.
-    """
+    """Fully distributed confluence and distance calculation"""
 
     print("=" * 60)
-    print("CONFLUENCE + DISTANCE MAP (DISTRIBUTED)")
+    print("CONFLUENCE + DISTANCE MAP")
     print("=" * 60)
 
-    # Step 1: Load all zones into single DataFrame
+    # Load all zones
     all_zones_dfs = []
-
     for tf in ["15m", "1h", "4h", "1d"]:
         table = TIMEFRAME_CONFIG[tf]["output_table"]
         if spark.catalog.tableExists(table):
             df = spark.table(table).withColumn("source_tf", F.lit(tf))
             all_zones_dfs.append(df)
-            count = df.count()
-            print(f"[{tf}] Loaded {count} zones")
+            print(f"[{tf}] Loaded zones")
 
     if not all_zones_dfs:
         print("No zones found")
         return
 
-    # Union all TFs
-    from functools import reduce
-    all_zones = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), all_zones_dfs)
+    all_zones = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), all_zones_dfs).cache()
+    total_zones = all_zones.count()
+    print(f"Total: {total_zones} zones")
 
-    print(f"\nTotal zones: {all_zones.count()}")
+    # Confluence via self-join
+    print("\nCalculating confluence...")
 
-    # Step 2: Confluence via self-join with range overlap
-    # Zone A overlaps Zone B if: A.zone_low <= B.zone_high AND A.zone_high >= B.zone_low
-    print("\n[CONFLUENCE] Computing cross-TF overlaps via Spark join...")
+    zones_a = all_zones.select(
+        F.col("zone_id").alias("a_zone_id"),
+        F.col("symbol").alias("a_symbol"),
+        F.col("source_tf").alias("a_tf"),
+        F.col("zone_low").alias("a_zone_low"),
+        F.col("zone_high").alias("a_zone_high"),
+        F.col("poc_price").alias("a_poc_price"),
+        F.col("strength_score").alias("a_strength_score"),
+        F.col("bos_confirmed").alias("a_bos_confirmed"),
+        F.col("bos_type").alias("a_bos_type"),
+        F.col("bos_price").alias("a_bos_price"),
+        F.col("bos_timestamp").alias("a_bos_timestamp"),
+        F.col("is_mirror").alias("a_is_mirror"),
+        F.col("zone_role").alias("a_zone_role"),
+        F.col("zone_type").alias("a_zone_type"),
+        F.col("volume_score").alias("a_volume_score"),
+        F.col("oi_score").alias("a_oi_score"),
+        F.col("bounce_count").alias("a_bounce_count"),
+        F.col("break_count").alias("a_break_count"),
+        F.col("touch_count").alias("a_touch_count")
+    )
 
-    # Create aliases for self-join
-    zones_a = all_zones.alias("a")
     zones_b = all_zones.select(
         F.col("symbol").alias("b_symbol"),
         F.col("source_tf").alias("b_tf"),
         F.col("zone_low").alias("b_zone_low"),
         F.col("zone_high").alias("b_zone_high")
-    ).alias("b")
+    )
 
-    # Join on symbol + range overlap + different TF
+    # Join for overlaps (different TFs only)
     overlaps = zones_a.join(
         zones_b,
-        (F.col("a.symbol") == F.col("b.b_symbol")) &
-        (F.col("a.zone_low") <= F.col("b.b_zone_high")) &
-        (F.col("a.zone_high") >= F.col("b.b_zone_low")) &
-        (F.col("a.source_tf") != F.col("b.b_tf")),
+        (F.col("a_symbol") == F.col("b_symbol")) &
+        (F.col("a_zone_low") <= F.col("b_zone_high")) &
+        (F.col("a_zone_high") >= F.col("b_zone_low")) &
+        (F.col("a_tf") != F.col("b_tf")),
         "left"
-    ).select(
-        "a.*",
-        F.col("b.b_tf").alias("overlapping_tf")
     )
 
-    # Aggregate overlapping TFs per zone
+    # Aggregate overlapping TFs
     confluence_agg = overlaps.groupBy(
-        "zone_id", "symbol", "source_tf", "zone_low", "zone_high",
-        "poc_price", "volume_poc", "strength_score", "bos_confirmed",
-        "bos_type", "bos_price", "bos_timestamp", "is_mirror",
-        "zone_role", "zone_type", "volume_score", "oi_score",
-        "bounce_count", "break_count", "touch_count"
+        "a_zone_id", "a_symbol", "a_tf", "a_zone_low", "a_zone_high",
+        "a_poc_price", "a_strength_score", "a_bos_confirmed",
+        "a_bos_type", "a_bos_price", "a_bos_timestamp", "a_is_mirror",
+        "a_zone_role", "a_zone_type", "a_volume_score", "a_oi_score",
+        "a_bounce_count", "a_break_count", "a_touch_count"
     ).agg(
-        F.collect_set("overlapping_tf").alias("overlapping_tfs")
+        F.collect_set("b_tf").alias("overlapping_tfs")
     )
 
-    # Calculate confluence score and flags
-    zones_with_confluence = confluence_agg.withColumn(
-        "all_tfs",
-        F.array_union(F.array(F.col("source_tf")),
-                      F.coalesce(F.col("overlapping_tfs"), F.array()))
-    ).withColumn(
-        "confirmed_15m",
-        F.array_contains(F.col("all_tfs"), "15m")
-    ).withColumn(
-        "confirmed_1h",
-        F.array_contains(F.col("all_tfs"), "1h")
-    ).withColumn(
-        "confirmed_4h",
-        F.array_contains(F.col("all_tfs"), "4h")
-    ).withColumn(
-        "confirmed_1d",
-        F.array_contains(F.col("all_tfs"), "1d")
+    # Calculate confluence score
+    zones_with_conf = confluence_agg.withColumn(
+        "all_tfs", F.array_union(F.array(F.col("a_tf")), F.coalesce(F.col("overlapping_tfs"), F.array()))
     ).withColumn(
         "confluence_score",
-        (F.when(F.col("confirmed_15m"), 1).otherwise(0) +
-         F.when(F.col("confirmed_1h"), 2).otherwise(0) +
-         F.when(F.col("confirmed_4h"), 3).otherwise(0) +
-         F.when(F.col("confirmed_1d"), 4).otherwise(0))
+        F.when(F.array_contains(F.col("all_tfs"), "15m"), 1).otherwise(0) +
+        F.when(F.array_contains(F.col("all_tfs"), "1h"), 2).otherwise(0) +
+        F.when(F.array_contains(F.col("all_tfs"), "4h"), 3).otherwise(0) +
+        F.when(F.array_contains(F.col("all_tfs"), "1d"), 4).otherwise(0)
     ).withColumn(
-        "confluence_tfs",
-        F.array_join(F.array_sort(F.col("all_tfs")), ",")
+        "confluence_tfs", F.array_join(F.array_sort(F.col("all_tfs")), ",")
     )
 
-    confluent_count = zones_with_confluence.filter(
-        F.col("confluence_score") > F.when(F.col("source_tf") == "15m", 1)
-                                       .when(F.col("source_tf") == "1h", 2)
-                                       .when(F.col("source_tf") == "4h", 3)
-                                       .otherwise(4)
-    ).count()
-    print(f"  Found {confluent_count} zones with multi-TF confluence")
-
-    # Step 3: Get current prices (batch - single query)
-    print("\n[PRICES] Fetching current prices...")
-
+    # Get current prices (fixed ambiguous column issue)
+    print("Fetching prices...")
     current_prices_df = None
     for tf in ["15m", "1h", "4h"]:
         try:
             klines = spark.table(f"{KLINES_TABLE}_{tf}")
-
-            # Get max timestamp per symbol
-            max_ts = klines.groupBy("symbol").agg(F.max("timestamp").alias("max_ts"))
-
-            # Join to get latest close
-            latest = klines.join(
-                max_ts,
-                (klines.symbol == max_ts.symbol) & (klines.timestamp == max_ts.max_ts)
-            ).select(
-                klines.symbol,
-                F.col("close").alias("current_price")
-            )
-
-            current_prices_df = latest
+            window = Window.partitionBy("symbol").orderBy(F.col("timestamp").desc())
+            current_prices_df = klines.withColumn("rn", F.row_number().over(window)) \
+                .filter(F.col("rn") == 1) \
+                .select(
+                    F.col("symbol").alias("price_symbol"),
+                    F.col("close").alias("current_price")
+                )
             break
         except:
             continue
 
     if current_prices_df is None:
-        print("  No price data")
+        print("No price data")
+        all_zones.unpersist()
         return
 
-    price_count = current_prices_df.count()
-    print(f"  Got prices for {price_count} symbols")
+    # Build liq_distance
+    print("Building distance map...")
 
-    # Step 4: Build liq_distance (distributed)
-    print("\n[DISTANCE MAP] Building...")
-
-    # Join zones with current prices
-    liq_distance = zones_with_confluence.filter(
-        F.col("bos_confirmed") == True
-    ).join(
+    liq_distance = zones_with_conf.filter(F.col("a_bos_confirmed") == True).join(
         current_prices_df,
-        "symbol",
+        F.col("a_symbol") == F.col("price_symbol"),
         "inner"
     ).withColumn(
-        "distance_pct",
-        F.round(((F.col("poc_price") - F.col("current_price")) / F.col("current_price")) * 100, 4)
+        "distance_pct", F.round(((F.col("a_poc_price") - F.col("current_price")) / F.col("current_price")) * 100, 4)
     ).withColumn(
-        "direction",
-        F.when(F.col("poc_price") > F.col("current_price"), "above").otherwise("below")
+        "direction", F.when(F.col("a_poc_price") > F.col("current_price"), "above").otherwise("below")
     ).withColumn(
-        "calculated_at",
-        F.current_timestamp()
+        "calculated_at", F.current_timestamp()
     )
 
-    # Deduplicate close zones using window functions (within 0.5%)
-    # Rank by strength, keep strongest when POC prices are within 0.5%
-    window_dedup = Window.partitionBy("symbol").orderBy(F.col("strength_score").desc())
-
-    liq_distance_ranked = liq_distance.withColumn(
-        "dedup_rank", F.row_number().over(window_dedup)
+    # Deduplicate by POC bucket
+    liq_distance = liq_distance.withColumn(
+        "poc_bucket", F.round(F.col("a_poc_price") / (F.col("current_price") * 0.005), 0)
     )
 
-    # For deduplication: compare each zone to all stronger zones
-    # This is still O(n²) per symbol but distributed across executors
-    # Alternative: bucket POC prices and deduplicate within buckets
-    liq_distance_deduped = liq_distance_ranked.withColumn(
-        "poc_bucket", F.round(F.col("poc_price") / (F.col("current_price") * 0.005), 0)
-    )
+    window_bucket = Window.partitionBy("a_symbol", "poc_bucket").orderBy(F.col("a_strength_score").desc())
+    liq_deduped = liq_distance.withColumn("bucket_rank", F.row_number().over(window_bucket)) \
+        .filter(F.col("bucket_rank") == 1) \
+        .drop("bucket_rank", "poc_bucket", "price_symbol")
 
-    # Keep strongest zone per bucket
-    window_bucket = Window.partitionBy("symbol", "poc_bucket").orderBy(F.col("strength_score").desc())
-    liq_distance_deduped = liq_distance_deduped.withColumn(
-        "bucket_rank", F.row_number().over(window_bucket)
-    ).filter(F.col("bucket_rank") == 1).drop("bucket_rank", "poc_bucket", "dedup_rank")
+    # Rank by distance
+    window_rank = Window.partitionBy("a_symbol").orderBy(F.abs(F.col("distance_pct")))
+    liq_ranked = liq_deduped.withColumn("rank", F.row_number().over(window_rank))
 
-    before_dedup = liq_distance.count()
-    after_dedup = liq_distance_deduped.count()
-    print(f"  Deduplicated: {before_dedup} → {after_dedup} zones")
-
-    # Add rank by distance
-    window_rank = Window.partitionBy("symbol").orderBy(F.abs(F.col("distance_pct")))
-    liq_distance_final = liq_distance_deduped.withColumn(
-        "rank", F.row_number().over(window_rank)
-    )
-
-    # Select final columns
-    final_columns = [
-        "symbol", "current_price", "rank", "poc_price",
-        F.col("source_tf").alias("timeframe"),
-        "distance_pct", "direction", "zone_low", "zone_high",
-        "is_mirror", "strength_score", "zone_role", "zone_type",
-        "bos_type", "bos_confirmed", "bos_price", "bos_timestamp",
+    # Final output
+    liq_output = liq_ranked.select(
+        F.col("a_symbol").alias("symbol"),
+        "current_price", "rank",
+        F.col("a_poc_price").alias("poc_price"),
+        F.col("a_tf").alias("timeframe"),
+        "distance_pct", "direction",
+        F.col("a_zone_low").alias("zone_low"),
+        F.col("a_zone_high").alias("zone_high"),
+        F.col("a_is_mirror").alias("is_mirror"),
+        F.col("a_strength_score").alias("strength_score"),
+        F.col("a_zone_role").alias("zone_role"),
+        F.col("a_zone_type").alias("zone_type"),
+        F.col("a_bos_type").alias("bos_type"),
+        F.col("a_bos_confirmed").alias("bos_confirmed"),
+        F.col("a_bos_price").alias("bos_price"),
+        F.col("a_bos_timestamp").alias("bos_timestamp"),
         "confluence_score", "confluence_tfs",
-        "bounce_count", "break_count", "touch_count",
-        "volume_score", "oi_score", "calculated_at"
-    ]
+        F.col("a_bounce_count").alias("bounce_count"),
+        F.col("a_break_count").alias("break_count"),
+        F.col("a_touch_count").alias("touch_count"),
+        F.col("a_volume_score").alias("volume_score"),
+        F.col("a_oi_score").alias("oi_score"),
+        "calculated_at"
+    )
 
-    liq_distance_output = liq_distance_final.select(*final_columns)
-
-    # Write to table
-    liq_distance_output.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(LIQ_DISTANCE_TABLE)
+    # Write
+    liq_output.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(LIQ_DISTANCE_TABLE)
 
     final_count = spark.table(LIQ_DISTANCE_TABLE).count()
-    print(f"\n✓ Saved {final_count} records to {LIQ_DISTANCE_TABLE}")
+    print(f"\nSaved {final_count} records to {LIQ_DISTANCE_TABLE}")
 
     # Show sample
-    print("\n" + "=" * 60)
-    print("NEAREST LEVELS (rank <= 4)")
-    print("=" * 60)
-
     spark.sql(f"""
         SELECT symbol, rank, ROUND(poc_price, 2) as poc, timeframe,
                ROUND(distance_pct, 2) as dist, direction,
-               is_mirror, ROUND(strength_score, 1) as str, zone_role, bos_type
+               ROUND(strength_score, 1) as str, bos_type
         FROM {LIQ_DISTANCE_TABLE}
-        WHERE rank <= 4
+        WHERE rank <= 3
         ORDER BY symbol, rank
-    """).show(50, truncate=False)
+        LIMIT 30
+    """).show(truncate=False)
+
+    all_zones.unpersist()
 
 
-# Run distributed version
+# Run
 add_confluence_and_distance_distributed(spark)

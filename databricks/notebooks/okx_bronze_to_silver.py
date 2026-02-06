@@ -9,6 +9,10 @@ BRONZE_SCHEMA = "bronze"
 SILVER_SCHEMA = "silver"
 EXCHANGE = "okx"
 
+TIMEFRAME_MS = {"15m": 900000, "1h": 3600000, "4h": 14400000, "1d": 86400000}
+CANDLES_TO_CHECK = 10
+SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "LDO-USDT-SWAP", "LINK-USDT-SWAP"]
+
 # Explode symbols array from bronze table
 def explode_symbols(interval):
     table_name = f"{CATALOG}.{BRONZE_SCHEMA}.{EXCHANGE}_{interval}"
@@ -233,13 +237,40 @@ def extract_taker_volume(df_exploded, interval):
     target_table = f"{CATALOG}.{SILVER_SCHEMA}.{EXCHANGE}_taker_ratio_{interval}"
     upsert_to_silver(df, target_table, ["timestamp", "symbol"])
 
+import time
+
+def validate_klines_completeness(interval):
+    table = f"{CATALOG}.{SILVER_SCHEMA}.{EXCHANGE}_klines_{interval}"
+    if not spark.catalog.tableExists(table):
+        return
+
+    now_ms = int(time.time() * 1000)
+    interval_ms = TIMEFRAME_MS[interval]
+    last_closed = ((now_ms - interval_ms) // interval_ms) * interval_ms
+    expected = [last_closed - (i * interval_ms) for i in range(CANDLES_TO_CHECK)]
+
+    df = spark.table(table)
+    for symbol in SYMBOLS:
+        existing = set(
+            row["timestamp"] for row in
+            df.filter(
+                (F.col("symbol") == symbol) &
+                (F.col("timestamp").isin(expected))
+            ).select("timestamp").distinct().collect()
+        )
+        missing = [ts for ts in expected if ts not in existing]
+        if missing:
+            print(f"  ⚠️ {symbol} [{interval}]: {len(missing)}/{CANDLES_TO_CHECK} candles missing")
+        else:
+            print(f"  ✓ {symbol} [{interval}]: all {CANDLES_TO_CHECK} candles present")
+
 # Process all intervals
 for interval in INTERVALS:
     print(f"\n{'='*60}")
     print(f"Processing {EXCHANGE}_{interval}")
     print(f"{'='*60}")
     try:
-        df_exploded = explode_symbols(interval)
+        df_exploded = explode_symbols(interval).cache()
         extract_klines(df_exploded, interval)
         extract_funding(df_exploded, interval)
         extract_funding_history(df_exploded, interval)
@@ -249,6 +280,9 @@ for interval in INTERVALS:
         # Sentiment data
         extract_long_short_ratio(df_exploded, interval)
         extract_taker_volume(df_exploded, interval)
+        df_exploded.unpersist()
+        # Validate klines completeness
+        validate_klines_completeness(interval)
     except Exception as e:
         print(f"✗ Error: {str(e)}")
 

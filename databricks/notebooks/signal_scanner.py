@@ -207,7 +207,9 @@ def load_sentiment_batch(symbols, timeframes):
     """
     table = f"{CATALOG}.{GOLD_SCHEMA}.sentiment_scores"
     try:
+        # Check existence inside try block - may throw permission error
         if not spark.catalog.tableExists(table):
+            print(f"  Sentiment table not found: {table}")
             return {}
 
         # Get latest sentiment per symbol+timeframe in ONE query
@@ -231,7 +233,8 @@ def load_sentiment_batch(symbols, timeframes):
             result[symbol][tf] = row.asDict()
 
         return result
-    except:
+    except Exception as e:
+        print(f"  Sentiment load skipped: {str(e)[:80]}")
         return {}
 
 

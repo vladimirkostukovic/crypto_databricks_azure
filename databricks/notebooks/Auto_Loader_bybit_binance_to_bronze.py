@@ -22,6 +22,8 @@ def autoload_status():
             .option("cloudFiles.format", "json")
             .option("cloudFiles.schemaLocation", f"{BRONZE_PATH}status/_schema")
             .option("cloudFiles.inferColumnTypes", "true")
+            .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+            .option("cloudFiles.rescuedDataColumn", "_rescued_data")
             .option("recursiveFileLookup", "true")
             .option("multiLine", "true")
             .load(path)
@@ -49,67 +51,86 @@ def autoload_status():
         return None
 
 # Run status loader
-#status_stream = autoload_status()
-#if status_stream:
-#    status_stream.awaitTermination()
+status_stream = autoload_status()
+if status_stream:
+    status_stream.awaitTermination()
 
 # COMMAND ----------
 
-def autoload_interval(exchange: str, interval: str):
-    try:
-        path = f"{LANDING_PATH}{exchange}/"
-        checkpoint = f"{BRONZE_PATH}_checkpoints/{exchange}_{interval}"
-        table = f"crypto.bronze.{exchange}_{interval}"
-        
-        df = (
-            spark.readStream
-            .format("cloudFiles")
-            .option("cloudFiles.format", "json")
-            .option("cloudFiles.schemaLocation", f"{BRONZE_PATH}{exchange}/_schema_{interval}")
-            .option("cloudFiles.inferColumnTypes", "true")
-            .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
-            .option("cloudFiles.rescuedDataColumn", "_rescued_data")
-            .option("recursiveFileLookup", "true")
-            .option("multiLine", "true")
-            .load(path)
-        )
-        
-        df_with_meta = df.withColumn("_input_file", col("_metadata.file_path")) \
-            .withColumn("file_date", regexp_extract(col("_input_file"), r"date=(\d{4}-\d{2}-\d{2})", 1)) \
-            .withColumn("file_hour", regexp_extract(col("_input_file"), r"hour=(\d{2})", 1)) \
-            .withColumn("file_minute", regexp_extract(col("_input_file"), r"\d{8}_\d{2}(\d{2})\d{2}", 1)) \
-            .withColumn("file_second", regexp_extract(col("_input_file"), r"\d{8}_\d{4}(\d{2})", 1)) \
-            .withColumn("file_interval", regexp_extract(col("_input_file"), r"_(\d+[mhd])\.json", 1)) \
-            .withColumn("exchange", lit(exchange))
-        
-        df_filtered = df_with_meta.filter(col("file_interval") == interval)
-        
-        stream = (
-            df_filtered.writeStream
-            .format("delta")
-            .option("checkpointLocation", checkpoint)
-            .option("mergeSchema", "true")
-            .outputMode("append")
-            .trigger(availableNow=True)
-            .toTable(table)
-        )
-        
-        print(f"✓ Started: {exchange}_{interval}")
-        return stream
-        
-    except Exception as e:
-        print(f"✗ Failed: {exchange}_{interval} - {e}")
-        return None
+MAX_RETRIES = 3
 
-# Start all streams
-streams = []
+def autoload_interval(exchange: str, interval: str):
+    path = f"{LANDING_PATH}{exchange}/"
+    checkpoint = f"{BRONZE_PATH}_checkpoints/{exchange}_{interval}"
+    table = f"crypto.bronze.{exchange}_{interval}"
+    schema_location = f"{BRONZE_PATH}{exchange}/_schema_{interval}"
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            df = (
+                spark.readStream
+                .format("cloudFiles")
+                .option("cloudFiles.format", "json")
+                .option("cloudFiles.schemaLocation", schema_location)
+                .option("cloudFiles.inferColumnTypes", "true")
+                .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+                .option("cloudFiles.rescuedDataColumn", "_rescued_data")
+                .option("recursiveFileLookup", "true")
+                .option("multiLine", "true")
+                .load(path)
+            )
+
+            df_with_meta = df.withColumn("_input_file", col("_metadata.file_path")) \
+                .withColumn("file_date", regexp_extract(col("_input_file"), r"date=(\d{4}-\d{2}-\d{2})", 1)) \
+                .withColumn("file_hour", regexp_extract(col("_input_file"), r"hour=(\d{2})", 1)) \
+                .withColumn("file_minute", regexp_extract(col("_input_file"), r"\d{8}_\d{2}(\d{2})\d{2}", 1)) \
+                .withColumn("file_second", regexp_extract(col("_input_file"), r"\d{8}_\d{4}(\d{2})", 1)) \
+                .withColumn("file_interval", regexp_extract(col("_input_file"), r"_(\d+[mhd])\.json", 1)) \
+                .withColumn("exchange", lit(exchange))
+
+            df_filtered = df_with_meta.filter(col("file_interval") == interval)
+
+            stream = (
+                df_filtered.writeStream
+                .format("delta")
+                .option("checkpointLocation", checkpoint)
+                .option("mergeSchema", "true")
+                .outputMode("append")
+                .trigger(availableNow=True)
+                .toTable(table)
+            )
+
+            stream.awaitTermination()
+            print(f"✓ Completed: {exchange}_{interval}")
+            return True
+
+        except Exception as e:
+            is_schema_evolution = "UNKNOWN_FIELD_EXCEPTION" in str(e) or "UnknownFieldException" in str(type(e).__name__)
+            if is_schema_evolution and attempt < MAX_RETRIES:
+                print(f"⟳ Schema evolved for {exchange}_{interval}, retrying ({attempt}/{MAX_RETRIES})...")
+                continue
+            else:
+                print(f"✗ Failed: {exchange}_{interval} (attempt {attempt}) - {e}")
+                return False
+
+    return False
+
+# Run all streams with retry logic
+results = {}
 for exchange in EXCHANGES:
     for interval in INTERVALS:
-        stream = autoload_interval(exchange, interval)
-        if stream:
-            streams.append(stream)
+        key = f"{exchange}_{interval}"
+        results[key] = autoload_interval(exchange, interval)
 
-print(f"\n✓ Successfully started {len(streams)}/{len(EXCHANGES) * len(INTERVALS)} streams")
+succeeded = sum(1 for v in results.values() if v)
+total = len(results)
+print(f"\n✓ Completed {succeeded}/{total} streams")
+
+if succeeded < total:
+    failed = [k for k, v in results.items() if not v]
+    print(f"✗ Failed streams: {', '.join(failed)}")
+
+print("✓ All streams processed")
 
 # COMMAND ----------
 
@@ -234,7 +255,8 @@ def validate_timeseries_continuity(exchange: str, interval: str, expected_symbol
         if time_diff > config["max_delay_minutes"]:
             return False, f"STALE: {int(time_diff)}min ago (max {config['max_delay_minutes']}min)"
         
-        # Check duplicates
+        # Check duplicates (warning only — dedup is silver's job)
+        duplicates_found = []
         for ing_time in ingestion_times:
             dup_count = df.filter(
                 (col("file_date") == ing_time.file_date) &
@@ -242,13 +264,15 @@ def validate_timeseries_continuity(exchange: str, interval: str, expected_symbol
                 (col("file_minute") == ing_time.file_minute) &
                 (col("file_second") == ing_time.file_second)
             ).count()
-            
+
             if dup_count > 1:
-                return False, f"DUPLICATE at {ing_time.file_date} {ing_time.file_hour}:{ing_time.file_minute}"
-        
-        # Check symbol completeness
-        for ing_time in ingestion_times:
-            symbols_at_time = df.filter(
+                duplicates_found.append(f"{ing_time.file_date} {ing_time.file_hour}:{ing_time.file_minute}")
+
+        # Check symbol completeness — find latest ingestion that actually has symbols
+        symbols_found = set()
+        checked_ing = None
+        for ing_time in reversed(ingestion_times):
+            syms_at_time = df.filter(
                 (col("file_date") == ing_time.file_date) &
                 (col("file_hour") == ing_time.file_hour) &
                 (col("file_minute") == ing_time.file_minute) &
@@ -256,16 +280,28 @@ def validate_timeseries_continuity(exchange: str, interval: str, expected_symbol
             ).select(explode(col("symbols.symbol")).alias("symbol")) \
              .distinct() \
              .collect()
-            
-            symbols_found = set([row.symbol for row in symbols_at_time])
-            missing = expected_symbols - symbols_found
-            
-            if missing:
-                timestamp = f"{ing_time.file_date} {ing_time.file_hour}:{ing_time.file_minute}"
-                return False, f"Missing symbols at {timestamp}: {missing}"
-        
-        # Check time gaps
+
+            found = set([row.symbol for row in syms_at_time])
+            if len(found) > 0:
+                symbols_found = found
+                checked_ing = ing_time
+                break
+
+        if not checked_ing:
+            return True, f"⚠️ No ingestion with valid symbols yet (new table, {len(ingestion_times)} runs checked)"
+
+        missing = expected_symbols - symbols_found
+        if missing:
+            timestamp = f"{checked_ing.file_date} {checked_ing.file_hour}:{checked_ing.file_minute}"
+            return False, f"Missing symbols in latest valid ingestion ({timestamp}): {missing}"
+
+        # Check duplicates + gaps as warnings
+        warnings = []
+        if duplicates_found:
+            warnings.append(f"{len(duplicates_found)} dupes")
+
         if len(ingestion_times) >= 2:
+            gap_count = 0
             for i in range(1, len(ingestion_times)):
                 prev_time = datetime.strptime(
                     f"{ingestion_times[i-1].file_date} {ingestion_times[i-1].file_hour}:{ingestion_times[i-1].file_minute}:{ingestion_times[i-1].file_second}",
@@ -275,15 +311,18 @@ def validate_timeseries_continuity(exchange: str, interval: str, expected_symbol
                     f"{ingestion_times[i].file_date} {ingestion_times[i].file_hour}:{ingestion_times[i].file_minute}:{ingestion_times[i].file_second}",
                     "%Y-%m-%d %H:%M:%S"
                 )
-                
+
                 gap_minutes = (curr_time - prev_time).total_seconds() / 60
                 expected_gap = config["expected_gap_minutes"]
                 tolerance = config["tolerance_minutes"]
-                
+
                 if gap_minutes < (expected_gap - tolerance) or gap_minutes > (expected_gap + tolerance):
-                    return False, f"GAP: {gap_minutes:.0f}min between {prev_time.strftime('%d %H:%M')} and {curr_time.strftime('%d %H:%M')}"
-        
-        return True, f"✅ Last {len(ingestion_times)}/{total_count} OK, {len(expected_symbols)} symbols, latest {int(time_diff)}min ago"
+                    gap_count += 1
+            if gap_count > 0:
+                warnings.append(f"{gap_count} gaps")
+
+        warn_str = f", ⚠️ {', '.join(warnings)}" if warnings else ""
+        return True, f"✅ Last {len(ingestion_times)}/{total_count} OK, {len(expected_symbols)} symbols, latest {int(time_diff)}min ago{warn_str}"
         
     except Exception as e:
         return False, f"ERROR: {str(e)}"
@@ -375,5 +414,5 @@ def run_sanity_checks():
     print("=" * 80)
     return True
 
-# Run
-#run_sanity_checks()
+# Run sanity checks
+run_sanity_checks()

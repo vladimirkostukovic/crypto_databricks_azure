@@ -142,25 +142,28 @@ print("\n" + "=" * 80)
 print("5. LATEST SENTIMENT SCORES")
 print("=" * 80)
 
-spark.sql(f"""
-    WITH latest AS (
-        SELECT *,
-            ROW_NUMBER() OVER (PARTITION BY symbol, timeframe ORDER BY timestamp DESC) as rn
-        FROM {CATALOG}.{GOLD_SCHEMA}.sentiment_scores
-    )
-    SELECT
-        symbol,
-        timeframe as tf,
-        ROUND(long_short_ratio, 2) as ls_ratio,
-        crowding_direction as crowding,
-        ROUND(sentiment_score, 1) as sent_score,
-        sentiment_bias as bias,
-        divergence_direction as smart_money,
-        aggression_direction as taker
-    FROM latest
-    WHERE rn = 1
-    ORDER BY symbol, timeframe
-""").show(50, truncate=False)
+try:
+    spark.sql(f"""
+        WITH latest AS (
+            SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY symbol, timeframe ORDER BY timestamp DESC) as rn
+            FROM {CATALOG}.{GOLD_SCHEMA}.sentiment_scores
+        )
+        SELECT
+            symbol,
+            timeframe as tf,
+            ROUND(long_short_ratio, 2) as ls_ratio,
+            crowding_direction as crowding,
+            ROUND(sentiment_score, 1) as sent_score,
+            sentiment_bias as bias,
+            divergence_direction as smart_money,
+            aggression_direction as taker
+        FROM latest
+        WHERE rn = 1
+        ORDER BY symbol, timeframe
+    """).show(50, truncate=False)
+except Exception as e:
+    print(f"Sentiment table not available: {str(e)[:60]}")
 
 # COMMAND ----------
 

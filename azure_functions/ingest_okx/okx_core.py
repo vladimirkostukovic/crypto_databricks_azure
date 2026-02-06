@@ -868,6 +868,18 @@ def run(intervals: List[str] = None, parallel: bool = True, max_workers: int = 4
                 logging.error(
                     f"✗ [{interval}] Failed to fetch {failed_count}/{len(SYMBOLS)} symbols after {max_attempts} attempts")
 
+            if success_count == 0:
+                logging.error(f"✗ [{interval}] No symbols fetched, skipping save")
+                results_by_interval[interval] = {
+                    "symbols_processed": 0,
+                    "symbols_failed": len(SYMBOLS),
+                    "file_saved": None,
+                    "attempts_made": max_attempts,
+                    "skipped": True
+                }
+                total_failed += len(SYMBOLS)
+                continue
+
             interval_data = {
                 "timestamp": now.isoformat(),
                 "exchange": "okx",

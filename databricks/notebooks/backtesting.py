@@ -3,7 +3,7 @@
 # BACKTESTING MODULE
 # Runs strategies on historical data from silver
 # Metrics: Sharpe, Max Drawdown, Win Rate, Profit Factor, Equity Curve
-# Output: gold.backtest_results
+# Output: trading.backtest_history_results, trading.backtest_history_trades, trading.backtest_history_equity
 # ---
 
 from pyspark.sql import functions as F
@@ -12,7 +12,6 @@ from pyspark.sql.types import *
 from delta.tables import DeltaTable
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Tuple, Optional
-import json
 import math
 
 # ---
@@ -21,19 +20,25 @@ import math
 
 CATALOG = "crypto"
 SILVER_SCHEMA = "silver"
-GOLD_SCHEMA = "gold"
+TRADING_SCHEMA = "trading"
+
+# Dynamic start_date: earliest data available in unified_klines_15m
+_min_ts_row = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.unified_klines_15m") \
+    .select(F.min("timestamp").alias("min_ts")).first()
+_dynamic_start = datetime.fromtimestamp(_min_ts_row["min_ts"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d") \
+    if _min_ts_row and _min_ts_row["min_ts"] else "2024-01-01"
 
 # Backtest parameters (can be overridden)
 BACKTEST_CONFIG = {
-    "start_date": "2024-01-01",
+    "start_date": _dynamic_start,
     "end_date": None,  # None = up to now
     "initial_capital": 10000,
     "risk_per_trade_pct": 1.0,
     "max_leverage": 10,
     "commission_pct": 0.04,  # 0.04% taker fee
     "slippage_pct": 0.02,    # 0.02% slippage
-    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-    "timeframes": ["15m", "1h", "4h"],
+    "symbols": ["BTCUSDT", "ETHUSDT", "LDOUSDT", "LINKUSDT"],
+    "timeframes": ["15m", "1h", "4h", "1d"],
     "strategies": ["smc", "liquidity"],
 
     # Strategy params
@@ -57,11 +62,13 @@ print(f"Strategies: {BACKTEST_CONFIG['strategies']}")
 print("=" * 80)
 
 # ---
-# CREATE RESULTS TABLE
+# CREATE RESULTS TABLES
 # ---
 
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{TRADING_SCHEMA}")
+
 spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {CATALOG}.{GOLD_SCHEMA}.backtest_results (
+CREATE TABLE IF NOT EXISTS {CATALOG}.{TRADING_SCHEMA}.backtest_history_results (
     backtest_id STRING,
     run_timestamp TIMESTAMP,
 
@@ -104,19 +111,74 @@ CREATE TABLE IF NOT EXISTS {CATALOG}.{GOLD_SCHEMA}.backtest_results (
     -- Time Metrics
     avg_hold_time_hours DOUBLE,
     max_consecutive_wins INT,
-    max_consecutive_losses INT,
-
-    -- Equity curve (JSON array)
-    equity_curve STRING,
-
-    -- Config snapshot
-    config_snapshot STRING
+    max_consecutive_losses INT
 )
 USING DELTA
 PARTITIONED BY (strategy)
 """)
 
-print("✓ Table gold.backtest_results ready")
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {CATALOG}.{TRADING_SCHEMA}.backtest_history_trades (
+    backtest_id STRING,
+    strategy STRING,
+    symbol STRING,
+    timeframe STRING,
+
+    trade_number INT,
+    type STRING,
+
+    entry_time BIGINT,
+    entry_price DOUBLE,
+    exit_time BIGINT,
+    exit_price DOUBLE,
+
+    stop_loss DOUBLE,
+    take_profit_1 DOUBLE,
+    take_profit_2 DOUBLE,
+
+    position_size DOUBLE,
+    exit_reason STRING,
+
+    pnl DOUBLE,
+    pnl_pct DOUBLE,
+    commission DOUBLE,
+
+    hold_time_hours DOUBLE,
+    tp1_hit BOOLEAN,
+
+    zone_strength DOUBLE,
+
+    volume_at_entry DOUBLE,
+    volume_at_exit DOUBLE,
+    avg_volume_before DOUBLE,
+    avg_volume_during DOUBLE,
+    volume_ratio_entry DOUBLE,
+
+    run_timestamp TIMESTAMP
+)
+USING DELTA
+PARTITIONED BY (strategy)
+""")
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {CATALOG}.{TRADING_SCHEMA}.backtest_history_equity (
+    backtest_id STRING,
+    strategy STRING,
+    symbol STRING,
+    timeframe STRING,
+
+    timestamp BIGINT,
+    equity DOUBLE,
+    capital DOUBLE,
+    drawdown_pct DOUBLE,
+
+    run_timestamp TIMESTAMP
+)
+USING DELTA
+PARTITIONED BY (strategy)
+""")
+
+print("✓ Tables trading.backtest_history_results, backtest_history_trades, backtest_history_equity ready")
 
 # ---
 # DATA LOADING
@@ -164,7 +226,7 @@ def load_historical_zones(symbol: str, timeframe: str, start_date: str, end_date
         if BACKTEST_CONFIG["require_bos"]:
             df = df.filter(F.col("bos_confirmed") == True)
 
-        return df.collect()
+        return [row.asDict() for row in df.collect()]
     except:
         return None
 
@@ -191,7 +253,7 @@ def load_historical_bos(symbol: str, timeframe: str, start_date: str, end_date: 
             (F.col("timestamp") <= end_ms)
         ).orderBy("timestamp")
 
-        return df.collect()
+        return [row.asDict() for row in df.collect()]
     except:
         return []
 
@@ -758,7 +820,10 @@ def calculate_metrics(trades: List[Trade], equity_curve: List[Dict],
 # ---
 
 def run_backtest(symbol: str, timeframe: str, strategy: str) -> Optional[Dict]:
-    """Run backtest for a single symbol/timeframe/strategy combination"""
+    """Run backtest for a single symbol/timeframe/strategy combination.
+
+    Returns dict with keys: result, trades_rows, equity_rows — or None.
+    """
 
     print(f"\n[{symbol}] {timeframe} - {strategy.upper()}")
 
@@ -821,13 +886,100 @@ def run_backtest(symbol: str, timeframe: str, strategy: str) -> Optional[Dict]:
 
     # Prepare result
     backtest_id = f"{symbol}_{timeframe}_{strategy}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    run_ts = datetime.now(timezone.utc)
 
-    # Downsample equity curve for storage (every 100th point)
-    sampled_equity = equity_curve[::max(1, len(equity_curve)//1000)]
+    # --- Build timestamp->index map and volume array for lookups ---
+    ts_to_idx = {c["timestamp"]: i for i, c in enumerate(klines_list)}
+    VOLUME_LOOKBACK = 10  # candles before entry for avg_volume_before
 
+    # --- Serialize trades ---
+    trades_rows = []
+    for idx, t in enumerate(trades, start=1):
+        hold_hours = (t.exit_time - t.entry_time) / (1000 * 60 * 60) if t.exit_time and t.entry_time else 0.0
+        pnl_pct = (t.pnl / (t.position_size * t.entry_price) * 100) if (t.position_size * t.entry_price) > 0 else 0.0
+
+        # --- Volume metrics ---
+        entry_idx = ts_to_idx.get(t.entry_time)
+        exit_idx = ts_to_idx.get(t.exit_time)
+
+        vol_at_entry = float(klines_list[entry_idx]["volume"]) if entry_idx is not None else 0.0
+        vol_at_exit = float(klines_list[exit_idx]["volume"]) if exit_idx is not None else 0.0
+
+        # Avg volume N candles before entry
+        if entry_idx is not None and entry_idx >= VOLUME_LOOKBACK:
+            before_vols = [klines_list[j]["volume"] for j in range(entry_idx - VOLUME_LOOKBACK, entry_idx)]
+            avg_vol_before = sum(before_vols) / len(before_vols)
+        else:
+            avg_vol_before = vol_at_entry  # fallback
+
+        # Avg volume during hold
+        if entry_idx is not None and exit_idx is not None and exit_idx > entry_idx:
+            during_vols = [klines_list[j]["volume"] for j in range(entry_idx, exit_idx + 1)]
+            avg_vol_during = sum(during_vols) / len(during_vols)
+        else:
+            avg_vol_during = vol_at_entry
+
+        vol_ratio = vol_at_entry / avg_vol_before if avg_vol_before > 0 else 0.0
+
+        trades_rows.append({
+            "backtest_id": backtest_id,
+            "strategy": strategy,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "trade_number": idx,
+            "type": t.type,
+            "entry_time": t.entry_time,
+            "entry_price": float(t.entry_price),
+            "exit_time": t.exit_time,
+            "exit_price": float(t.exit_price) if t.exit_price else None,
+            "stop_loss": float(t.stop_loss),
+            "take_profit_1": float(t.take_profit_1),
+            "take_profit_2": float(t.take_profit_2),
+            "position_size": float(t.position_size),
+            "exit_reason": t.exit_reason,
+            "pnl": float(round(t.pnl, 4)),
+            "pnl_pct": float(round(pnl_pct, 4)),
+            "commission": float(round(t.commission, 4)),
+            "hold_time_hours": float(round(hold_hours, 2)),
+            "tp1_hit": t.tp1_hit,
+            "zone_strength": float(t.signal.get("zone_strength", 0)),
+            "volume_at_entry": float(round(vol_at_entry, 2)),
+            "volume_at_exit": float(round(vol_at_exit, 2)),
+            "avg_volume_before": float(round(avg_vol_before, 2)),
+            "avg_volume_during": float(round(avg_vol_during, 2)),
+            "volume_ratio_entry": float(round(vol_ratio, 4)),
+            "run_timestamp": run_ts,
+        })
+
+    # --- Serialize equity curve (sampled) ---
+    # Sample rate: every 10th point for 15m, every point for 4h/1d
+    sample_step = 10 if timeframe == "15m" else (4 if timeframe == "1h" else 1)
+    sampled_equity = equity_curve[::sample_step]
+
+    # Pre-compute peak for drawdown_pct
+    peak = BACKTEST_CONFIG["initial_capital"]
+    equity_rows = []
+    for point in sampled_equity:
+        eq = point["equity"]
+        if eq > peak:
+            peak = eq
+        dd_pct = (peak - eq) / peak * 100 if peak > 0 else 0.0
+        equity_rows.append({
+            "backtest_id": backtest_id,
+            "strategy": strategy,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "timestamp": point["timestamp"],
+            "equity": float(round(eq, 2)),
+            "capital": float(round(point["capital"], 2)),
+            "drawdown_pct": float(round(dd_pct, 2)),
+            "run_timestamp": run_ts,
+        })
+
+    # --- Metrics result (no JSON columns) ---
     result = {
         "backtest_id": backtest_id,
-        "run_timestamp": datetime.now(timezone.utc),
+        "run_timestamp": run_ts,
         "strategy": strategy,
         "symbol": symbol,
         "timeframe": timeframe,
@@ -836,11 +988,9 @@ def run_backtest(symbol: str, timeframe: str, strategy: str) -> Optional[Dict]:
         "initial_capital": float(BACKTEST_CONFIG["initial_capital"]),
         "risk_per_trade_pct": float(BACKTEST_CONFIG["risk_per_trade_pct"]),
         **metrics,
-        "equity_curve": json.dumps(sampled_equity),
-        "config_snapshot": json.dumps(BACKTEST_CONFIG)
     }
 
-    return result
+    return {"result": result, "trades_rows": trades_rows, "equity_rows": equity_rows}
 
 
 # ---
@@ -852,14 +1002,18 @@ print("RUNNING BACKTESTS")
 print("=" * 80)
 
 all_results = []
+all_trades_rows = []
+all_equity_rows = []
 
 for symbol in BACKTEST_CONFIG["symbols"]:
     for timeframe in BACKTEST_CONFIG["timeframes"]:
         for strategy in BACKTEST_CONFIG["strategies"]:
             try:
-                result = run_backtest(symbol, timeframe, strategy)
-                if result:
-                    all_results.append(result)
+                output = run_backtest(symbol, timeframe, strategy)
+                if output:
+                    all_results.append(output["result"])
+                    all_trades_rows.extend(output["trades_rows"])
+                    all_equity_rows.extend(output["equity_rows"])
             except Exception as e:
                 print(f"  ERROR: {str(e)[:100]}")
 
@@ -872,7 +1026,8 @@ print("SAVING RESULTS")
 print("=" * 80)
 
 if all_results:
-    schema = StructType([
+    # --- 1. Save metrics to backtest_history_results ---
+    results_schema = StructType([
         StructField("backtest_id", StringType()),
         StructField("run_timestamp", TimestampType()),
         StructField("strategy", StringType()),
@@ -904,16 +1059,69 @@ if all_results:
         StructField("avg_hold_time_hours", DoubleType()),
         StructField("max_consecutive_wins", IntegerType()),
         StructField("max_consecutive_losses", IntegerType()),
-        StructField("equity_curve", StringType()),
-        StructField("config_snapshot", StringType())
     ])
 
-    results_df = spark.createDataFrame(all_results, schema)
+    results_df = spark.createDataFrame(all_results, results_schema)
+    results_table = f"{CATALOG}.{TRADING_SCHEMA}.backtest_history_results"
+    results_df.write.format("delta").mode("append").saveAsTable(results_table)
+    print(f"✓ Saved {len(all_results)} results to {results_table}")
 
-    target_table = f"{CATALOG}.{GOLD_SCHEMA}.backtest_results"
-    results_df.write.format("delta").mode("append").saveAsTable(target_table)
+    # --- 2. Save trades to backtest_history_trades ---
+    if all_trades_rows:
+        trades_schema = StructType([
+            StructField("backtest_id", StringType()),
+            StructField("strategy", StringType()),
+            StructField("symbol", StringType()),
+            StructField("timeframe", StringType()),
+            StructField("trade_number", IntegerType()),
+            StructField("type", StringType()),
+            StructField("entry_time", LongType()),
+            StructField("entry_price", DoubleType()),
+            StructField("exit_time", LongType()),
+            StructField("exit_price", DoubleType()),
+            StructField("stop_loss", DoubleType()),
+            StructField("take_profit_1", DoubleType()),
+            StructField("take_profit_2", DoubleType()),
+            StructField("position_size", DoubleType()),
+            StructField("exit_reason", StringType()),
+            StructField("pnl", DoubleType()),
+            StructField("pnl_pct", DoubleType()),
+            StructField("commission", DoubleType()),
+            StructField("hold_time_hours", DoubleType()),
+            StructField("tp1_hit", BooleanType()),
+            StructField("zone_strength", DoubleType()),
+            StructField("volume_at_entry", DoubleType()),
+            StructField("volume_at_exit", DoubleType()),
+            StructField("avg_volume_before", DoubleType()),
+            StructField("avg_volume_during", DoubleType()),
+            StructField("volume_ratio_entry", DoubleType()),
+            StructField("run_timestamp", TimestampType()),
+        ])
 
-    print(f"✓ Saved {len(all_results)} backtest results to {target_table}")
+        trades_df = spark.createDataFrame(all_trades_rows, trades_schema)
+        trades_table = f"{CATALOG}.{TRADING_SCHEMA}.backtest_history_trades"
+        trades_df.write.format("delta").mode("append").saveAsTable(trades_table)
+        print(f"✓ Saved {len(all_trades_rows)} trades to {trades_table}")
+
+    # --- 3. Save equity curve to backtest_history_equity ---
+    if all_equity_rows:
+        equity_schema = StructType([
+            StructField("backtest_id", StringType()),
+            StructField("strategy", StringType()),
+            StructField("symbol", StringType()),
+            StructField("timeframe", StringType()),
+            StructField("timestamp", LongType()),
+            StructField("equity", DoubleType()),
+            StructField("capital", DoubleType()),
+            StructField("drawdown_pct", DoubleType()),
+            StructField("run_timestamp", TimestampType()),
+        ])
+
+        equity_df = spark.createDataFrame(all_equity_rows, equity_schema)
+        equity_table = f"{CATALOG}.{TRADING_SCHEMA}.backtest_history_equity"
+        equity_df.write.format("delta").mode("append").saveAsTable(equity_table)
+        print(f"✓ Saved {len(all_equity_rows)} equity points to {equity_table}")
+
 else:
     print("No results to save")
 
@@ -937,7 +1145,7 @@ spark.sql(f"""
         ROUND(profit_factor, 2) as pf,
         ROUND(sharpe_ratio, 2) as sharpe,
         ROUND(max_drawdown_pct, 1) as max_dd
-    FROM {CATALOG}.{GOLD_SCHEMA}.backtest_results
+    FROM {CATALOG}.{TRADING_SCHEMA}.backtest_history_results
     WHERE run_timestamp >= current_timestamp() - INTERVAL 1 HOUR
     ORDER BY net_profit_pct DESC
 """).show(50, truncate=False)
@@ -953,7 +1161,7 @@ spark.sql(f"""
         ROUND(sharpe_ratio, 2) as sharpe,
         ROUND(win_rate, 1) as win_rate,
         ROUND(profit_factor, 2) as pf
-    FROM {CATALOG}.{GOLD_SCHEMA}.backtest_results
+    FROM {CATALOG}.{TRADING_SCHEMA}.backtest_history_results
     WHERE run_timestamp >= current_timestamp() - INTERVAL 1 HOUR
       AND total_trades >= 10
     ORDER BY sharpe_ratio DESC
